@@ -81,9 +81,11 @@ def classify_state(
 SOC_FULL_EPS_KWH = 0.2        # how close to soc_max counts as "full" (arm)
 SOC_DISARM_EPS_KWH = 0.5      # wider margin to stay armed (avoid self-disarm)
 PROBE_FORECAST_MARGIN_KW = 0.5  # forecast surplus must exceed this to arm
-PROBE_DISCHARGE_CEILING_W = 300.0  # step down above this battery discharge
+PROBE_DISCHARGE_CEILING_W = 300.0  # soft band floor: sustained drain steps down
+PROBE_DISCHARGE_HARD_W = 1500.0    # hard ceiling: step down immediately
 PROBE_IMPORT_CEILING_W = 500.0     # step down above this grid import
-PROBE_UP_INTERVAL_CYCLES = 3       # min cycles between speculative up-steps
+PROBE_UP_INTERVAL_CYCLES = 1       # min cycles between speculative up-steps
+PROBE_OVERSHOOT_SUSTAIN_CYCLES = 2  # soft-band cycles before stepping down
 
 
 def should_probe_surplus(
@@ -123,10 +125,11 @@ def should_probe_surplus(
 
 @dataclass(frozen=True)
 class SurplusProbeDecision:
-    """One regulator step: next commanded current and updated up-counter."""
+    """One regulator step: next commanded current and updated counters."""
 
     current_a: int           # integer A; 0 disables charging
     cycles_since_up: int
+    cycles_overshooting: int = 0   # consecutive cycles inside the soft band
 
 
 def decide_surplus_probe(
@@ -136,26 +139,43 @@ def decide_surplus_probe(
     forecast_surplus_kw: float,
     current_a: int,
     cycles_since_up: int,
+    cycles_overshooting: int,
     ev,  # EVParams
 ) -> SurplusProbeDecision:
     """Zero-import regulator step (see spec §"Control law").
 
-    Down (responsive): on battery discharge or grid import past the ceilings,
-    step down one amp immediately (below min -> 0). Up (speculative, lazy): at
-    most one amp every PROBE_UP_INTERVAL_CYCLES, only while not overshooting,
-    below max, and the next amp still fits the forecast surplus headroom.
-    Otherwise hold and advance the up-counter.
+    Down, two-tier. Past ``PROBE_DISCHARGE_HARD_W`` of battery discharge, or
+    *any* grid import past ``PROBE_IMPORT_CEILING_W``, step down one amp
+    immediately (below min -> 0): the loss is real and happening now. Inside
+    the soft band (``PROBE_DISCHARGE_CEILING_W`` .. hard) the drain must
+    persist ``PROBE_OVERSHOOT_SUSTAIN_CYCLES`` consecutive cycles first, so a
+    transient — a kettle, a passing cloud, the settling tick right after an
+    up-step — doesn't ratchet the current down. While counting we hold rather
+    than step up: we already suspect we're over.
+
+    Up (speculative): at most one amp every PROBE_UP_INTERVAL_CYCLES, only
+    while not overshooting, below max, and the next amp still fits the
+    forecast surplus headroom. Otherwise hold and advance the up-counter.
     """
     min_a = int(round(ev.min_charging_current_a))
     max_a = int(round(ev.max_charging_current_a))
 
-    overshoot = (battery_discharge_w > PROBE_DISCHARGE_CEILING_W
-                 or grid_import_w > PROBE_IMPORT_CEILING_W)
-    if overshoot:
+    def _step_down() -> SurplusProbeDecision:
         new_a = current_a - 1
         if new_a < min_a:
             return SurplusProbeDecision(current_a=0, cycles_since_up=0)
         return SurplusProbeDecision(current_a=new_a, cycles_since_up=0)
+
+    if (battery_discharge_w > PROBE_DISCHARGE_HARD_W
+            or grid_import_w > PROBE_IMPORT_CEILING_W):
+        return _step_down()
+
+    if battery_discharge_w > PROBE_DISCHARGE_CEILING_W:
+        sustained = cycles_overshooting + 1
+        if sustained >= PROBE_OVERSHOOT_SUSTAIN_CYCLES:
+            return _step_down()
+        return SurplusProbeDecision(current_a=current_a, cycles_since_up=0,
+                                    cycles_overshooting=sustained)
 
     if current_a < min_a:
         # Not charging yet — kick to min as the first probe.

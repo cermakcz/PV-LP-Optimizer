@@ -12,6 +12,7 @@ from custom_components.pv_optimizer.ev_controller import (
     SOC_DISARM_EPS_KWH,
     decide_surplus_probe,
     PROBE_UP_INTERVAL_CYCLES,
+    PROBE_OVERSHOOT_SUSTAIN_CYCLES,
 )
 
 
@@ -516,6 +517,7 @@ def _probe(**over):
         forecast_surplus_kw=10.0,
         current_a=0,
         cycles_since_up=0,
+        cycles_overshooting=0,
         ev=_PROBE_EV,
     )
     base.update(over)
@@ -528,27 +530,54 @@ def test_probe_kicks_to_min_when_not_charging() -> None:
     assert d.cycles_since_up == 0
 
 
-def test_probe_steps_down_on_battery_discharge() -> None:
+def test_probe_holds_on_first_soft_battery_discharge() -> None:
+    # Inside the soft band (300..1500 W): a single tick of drain is not enough
+    # to give up the current. Hold — notably WITHOUT stepping up — and count.
     d = _probe(current_a=10, battery_discharge_w=500.0)
+    assert d.current_a == 10
+    assert d.cycles_overshooting == 1
+
+
+def test_probe_steps_down_after_sustained_soft_battery_discharge() -> None:
+    d = _probe(current_a=10, battery_discharge_w=500.0,
+               cycles_overshooting=PROBE_OVERSHOOT_SUSTAIN_CYCLES - 1)
     assert d.current_a == 9
     assert d.cycles_since_up == 0
+    assert d.cycles_overshooting == 0
+
+
+def test_probe_soft_overshoot_counter_resets_on_clean_cycle() -> None:
+    # A transient dip must not accumulate across unrelated ticks.
+    d = _probe(current_a=10, battery_discharge_w=0.0, cycles_overshooting=1)
+    assert d.cycles_overshooting == 0
+
+
+def test_probe_steps_down_immediately_on_hard_battery_discharge() -> None:
+    # Past the hard ceiling the drain is real (e.g. a cloud killed PV and the
+    # car is pulling kW out of the house battery) — correct now, don't wait.
+    d = _probe(current_a=10, battery_discharge_w=2000.0)
+    assert d.current_a == 9
+    assert d.cycles_since_up == 0
+    assert d.cycles_overshooting == 0
 
 
 def test_probe_steps_down_on_grid_import() -> None:
+    # Grid import is never sustained-gated: we are paying for it.
     d = _probe(current_a=10, grid_import_w=800.0)
     assert d.current_a == 9
+    assert d.cycles_overshooting == 0
 
 
 def test_probe_below_min_goes_to_zero() -> None:
-    d = _probe(current_a=6, battery_discharge_w=500.0)
+    d = _probe(current_a=6, battery_discharge_w=2000.0)
     assert d.current_a == 0
 
 
-def test_probe_holds_inside_deadband() -> None:
-    # No overshoot, interval not yet reached -> hold, count up.
+def test_probe_steps_up_every_cycle() -> None:
+    # Ramp is aggressive: a clean cycle steps up, no rate-limit dwell.
     d = _probe(current_a=10, cycles_since_up=0)
-    assert d.current_a == 10
-    assert d.cycles_since_up == 1
+    assert d.current_a == 11
+    assert d.cycles_since_up == 0
 
 
 def test_probe_steps_up_after_interval() -> None:

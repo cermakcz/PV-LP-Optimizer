@@ -370,11 +370,26 @@ to be **discovered**, by pushing load and watching what the grid does.
 
 When the planner detects exactly that corner (battery full, export disabled,
 car connected, forecast says surplus exists, LP not already charging) it takes
-over the charger and runs a slow zero-import regulator: nudge the current up
-one amp at a time, and back off the instant the house battery starts
-discharging or the grid starts importing. It rests one amp *below* the true
-surplus on purpose — leaving a fraction of an amp of free solar unused is the
-cheap mistake; paying for grid is not.
+over the charger and runs a zero-import regulator: nudge the current up an amp
+every tick, and give an amp back when it has clearly gone too far. It rests one
+amp *below* the true surplus on purpose — leaving a fraction of an amp of free
+solar unused is the cheap mistake; paying for grid is not.
+
+Backing off is deliberately two-speed, because "the battery is discharging a
+bit" and "the battery is emptying into the car" want different reactions:
+
+| Signal | Reaction |
+|---|---|
+| Grid importing (> 500 W) | Step down immediately — that's money leaving now. |
+| Battery draining hard (> 1500 W) | Step down immediately — PV has collapsed, probably a cloud. |
+| Battery draining a little (300–1500 W) | Hold, and only step down if it's still happening two ticks later. |
+
+The middle row is what keeps the probe from getting spooked: a kettle switching
+on, a brief cloud, or simply the tick right after a step-up (before the inverter
+has unclipped production to match) all look like a small drain for a moment.
+Waiting one tick rides those out, while a genuine collapse still gets caught on
+the very next tick by the hard threshold. Worst case the house battery gives up
+roughly 250 Wh before the regulator corrects.
 
 This needs the optional **battery power** entity (signed, negative =
 discharging) wired up in the Entities step. Without it the probe stays off

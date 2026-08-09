@@ -2259,13 +2259,32 @@ def test_probe_disarms_back_to_auto_when_exporting() -> None:
     assert p.ev_state.probe_armed is False
     assert p.ev_state.probe_current_a == 0
     assert p.ev_state.probe_cycles_since_up == 0
+    assert p.ev_state.probe_cycles_overshooting == 0
     mode_writes = [c for c in p.caller.calls if c[2].get("entity_id") == "select.ev_mode"]
     assert mode_writes and mode_writes[-1][2]["option"] == "Auto"
 
 
+def test_probe_holds_then_steps_down_on_sustained_drain() -> None:
+    # 500 W sits in the soft band: the first tick holds the current (and does
+    # not step up), the second gives an amp back.
+    states = _probe_states()
+    states["sensor.batt_w"] = StateView(state="-500")
+    p = Planner(_config(ev=_probe_ev_cfg(), battery_power_entity="sensor.batt_w"),
+                FakeReader(states), FakeCaller())
+    p.ev_state.probe_armed = True
+    p.ev_state.probe_current_a = 10
+    p.step(NOW)
+    assert p.ev_state.probe_current_a == 10
+    assert p.ev_state.probe_cycles_overshooting == 1
+    p.step(NOW + timedelta(minutes=5))
+    assert p.ev_state.probe_current_a == 9
+    assert p.ev_state.probe_cycles_overshooting == 0
+
+
 def test_probe_steps_to_zero_and_stops_on_overshoot() -> None:
     states = _probe_states()
-    states["sensor.batt_w"] = StateView(state="-500")  # discharging 500 W > ceiling
+    # Past the hard ceiling -> immediate, no sustain wait.
+    states["sensor.batt_w"] = StateView(state="-2000")
     p = Planner(_config(ev=_probe_ev_cfg(), battery_power_entity="sensor.batt_w"),
                 FakeReader(states), FakeCaller())
     p.ev_state.probe_armed = True

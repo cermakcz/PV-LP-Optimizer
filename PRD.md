@@ -686,8 +686,9 @@ cannot silently read as "not discharging".
 
 | Direction | Rule |
 |---|---|
-| **Down** (responsive) | Battery discharge > `PROBE_DISCHARGE_CEILING_W` *or* grid import > `PROBE_IMPORT_CEILING_W` → step down 1 A immediately. Below `min_a` → command 0 and stay armed, waiting for more sun. |
-| **Up** (speculative, lazy) | At most 1 A every `PROBE_UP_INTERVAL_CYCLES`, only while not overshooting, below `max_a`, and the next amp still fits the forecast headroom. |
+| **Down, immediate** | Battery discharge > `PROBE_DISCHARGE_HARD_W` *or* grid import > `PROBE_IMPORT_CEILING_W` → step down 1 A now. Below `min_a` → command 0 and stay armed, waiting for more sun. |
+| **Down, sustained** | Battery discharge in the *soft band* (`PROBE_DISCHARGE_CEILING_W` … hard) → hold and count. Step down only once the drain has persisted `PROBE_OVERSHOOT_SUSTAIN_CYCLES` consecutive cycles. Any clean cycle resets the counter. |
+| **Up** (speculative) | 1 A every `PROBE_UP_INTERVAL_CYCLES`, only while not overshooting, below `max_a`, and the next amp still fits the forecast headroom. |
 | **Rest** | Otherwise hold and advance the up-counter. |
 
 The feedback is one-sided — import is ~0 for *every* current at or below the
@@ -696,12 +697,29 @@ clean signal while extra headroom can only be found speculatively. The bias is
 to **undershoot**: resting one amp below the true surplus leaves <1 A of free
 solar curtailed, which is the cheap error; importing is not.
 
-Three levers prevent limit-cycling on a quantized (integer-amp) actuator: the
-down-side ceilings act as a noise deadband; the rate-limited up-probe bounds
-the up direction, so a failed probe costs at most a 1 A import blip once per
-interval rather than per cycle; and the forecast-headroom gate suppresses
-pointless probing near the forecast potential. Note the phase wrinkle: at
-~0.69 kW/A three-phase the effective rest band is wider than single-phase's
+**Why the down side is two-tier.** A single ceiling forces one number to serve
+two jobs: rejecting noise and capping the loss. Set it low and the probe backs
+off on any transient — a kettle, a passing cloud, or simply the settling tick
+right after an up-step, before the inverter has unclipped PV to match. Set it
+high and the probe will happily rest at a continuous drain, trickling the
+house battery into the car at round-trip loss for as long as the sun holds.
+Splitting them lets each threshold do one job: the soft band tolerates
+transients *without* raising what we're willing to lose at rest, while the hard
+ceiling still catches a genuine collapse (cloud kills PV, car keeps pulling kW)
+on the very next tick. Worst case before correction is bounded by
+`PROBE_DISCHARGE_HARD_W × PROBE_OVERSHOOT_SUSTAIN_CYCLES × cadence` ≈ 250 Wh at
+the defaults. Note that grid import is **never** sustain-gated: unlike a
+battery drain, it is money leaving immediately.
+
+Limit-cycling on a quantized (integer-amp) actuator is held off by three
+levers: the soft-band sustain requirement absorbs sensor noise and transients
+before any down-step fires; while counting, the probe holds instead of stepping
+up, so it never ratchets further into an overshoot it already suspects; and the
+forecast-headroom gate suppresses pointless probing near the forecast
+potential. With `PROBE_UP_INTERVAL_CYCLES = 1` the up-rate limiter is
+effectively off — the ramp is deliberately aggressive, since the sustain
+counter now absorbs the noise the rate limit used to. Note the phase wrinkle:
+at ~0.69 kW/A three-phase the effective rest band is wider than single-phase's
 ~0.23 kW/A, so more free solar is left on the table.
 
 **Disarming** happens as soon as any arm condition fails — export re-enabled,
@@ -718,9 +736,11 @@ derived from `kw_per_amp`):
 | `SOC_FULL_EPS_KWH` | `0.2` kWh |
 | `SOC_DISARM_EPS_KWH` | `0.5` kWh |
 | `PROBE_FORECAST_MARGIN_KW` | `0.5` kW |
-| `PROBE_DISCHARGE_CEILING_W` | `300` W |
-| `PROBE_IMPORT_CEILING_W` | `500` W |
-| `PROBE_UP_INTERVAL_CYCLES` | `3` (~15 min at the default 300 s cadence) |
+| `PROBE_DISCHARGE_CEILING_W` | `300` W (soft-band floor) |
+| `PROBE_DISCHARGE_HARD_W` | `1500` W (immediate step-down) |
+| `PROBE_IMPORT_CEILING_W` | `500` W (immediate step-down) |
+| `PROBE_UP_INTERVAL_CYCLES` | `1` (step up every cycle) |
+| `PROBE_OVERSHOOT_SUSTAIN_CYCLES` | `2` (~10 min at the default 300 s cadence) |
 
 ### 9.7 Write discipline and on-demand re-plan
 Throughout §9, writes to the two *optional* outputs — the start switch and the

@@ -76,6 +76,7 @@ class EVRuntimeState:
     probe_armed: bool = False
     probe_current_a: int = 0
     probe_cycles_since_up: int = 0
+    probe_cycles_overshooting: int = 0
 
 
 @dataclass(frozen=True)
@@ -941,6 +942,7 @@ class Planner:
                 es.probe_armed = False
                 es.probe_current_a = 0
                 es.probe_cycles_since_up = 0
+                es.probe_cycles_overshooting = 0
             return False
         decision = decide_surplus_probe(
             battery_discharge_w=max(0.0, -batt),
@@ -948,6 +950,7 @@ class Planner:
             forecast_surplus_kw=forecast_surplus,
             current_a=es.probe_current_a,
             cycles_since_up=es.probe_cycles_since_up,
+            cycles_overshooting=es.probe_cycles_overshooting,
             ev=cfg.params,
         )
         # Mode first so any active/passive transition cache invalidation lands
@@ -958,6 +961,7 @@ class Planner:
         es.probe_armed = True
         es.probe_current_a = decision.current_a
         es.probe_cycles_since_up = decision.cycles_since_up
+        es.probe_cycles_overshooting = decision.cycles_overshooting
         return True
 
     def _read_mode(self) -> str:
