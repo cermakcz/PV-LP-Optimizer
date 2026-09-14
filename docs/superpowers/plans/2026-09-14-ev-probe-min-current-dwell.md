@@ -1564,9 +1564,16 @@ The second grep finds the EV config-field tables — the new fields belong in th
 >
 > | Surplus | Behaviour | Connector cycles |
 > |---|---|---|
-> | 3 kW (reported case) | ~50 min on, ~20 min off, repeating | 1 per ~70 min |
+> | 3 kW (reported case) | ~55 min on, ~25 min off, repeating | 1 per ~80 min |
 > | 0 kW (sun gone) | one bounded drain event, then stays off | 1, then none |
 > | ≥ 4.1 kW | no drain at all — probe steps *up*, never sits at min | none |
+>
+> (Earlier revisions of this note said 50/20 and then 45/15. Both came from a
+> simulation whose deficit accounting credited battery recovery on the tick the
+> car was still drawing — it gated on the post-decision current rather than the
+> one actually in force during the tick. Fixed in `12957c1`; 55/25 is the
+> verified figure. The perturbation response is close to linear: doubling
+> `soc_drop_kwh` roughly doubles the charging run, halving it halves it.)
 >
 > The spec's claim that a full battery's discharge is "immediately refilled" by
 > curtailed PV holds only while surplus **exceeds** the EV draw. At 6 A drawing
