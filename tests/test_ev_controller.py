@@ -574,6 +574,24 @@ def test_probe_restart_allowed_after_cooldown() -> None:
     assert d.current_a == 6
 
 
+def test_probe_restart_cooldown_boundary_is_exclusive() -> None:
+    """The gate is ``probe_off_seconds < cooldown``, so exactly-equal is
+    treated as elapsed. Pinned because an off-by-one here is easy to
+    introduce and would silently extend every cooldown by a full cycle.
+    """
+    d = _probe(current_a=0, probe_off_seconds=600.0)
+    assert d.current_a == 6
+
+
+def test_probe_restart_soc_boundary_is_exclusive() -> None:
+    """The gate is ``soc_deficit_kwh > restart_eps``, so a deficit exactly at
+    restart_eps still permits the restart.
+    """
+    d = _probe(current_a=0, probe_off_seconds=1200.0,
+               soc_deficit_kwh=SOC_FULL_EPS_KWH)
+    assert d.current_a == 6
+
+
 def test_probe_restart_blocked_until_battery_full_again() -> None:
     """Cooldown elapsed is not enough. The battery must be genuinely full
     again (the arm epsilon, not the looser hold budget) — otherwise a sunless
@@ -642,9 +660,59 @@ def test_probe_steps_down_on_grid_import() -> None:
     assert d.cycles_overshooting == 0
 
 
-def test_probe_below_min_goes_to_zero() -> None:
-    d = _probe(current_a=6, battery_discharge_w=2000.0)
+def test_probe_holds_at_min_inside_the_min_on_floor() -> None:
+    """REGRESSION for the reported chatter.
+
+    At min current there is no down-step, so the old law stopped. On a
+    three-phase charger 6 A is a ~4.1 kW quantum, larger than typical
+    curtailed surplus, so the drain test was permanently unsatisfiable and
+    the probe stopped every time it reached min.
+    """
+    d = _probe(current_a=6, battery_discharge_w=500.0, probe_on_seconds=120.0)
+    assert d.current_a == 6
+
+
+def test_probe_holds_at_min_through_hard_drain_inside_the_floor() -> None:
+    """Deliberate change: PROBE_DISCHARGE_HARD_W no longer stops charging
+    instantly at min current. Its worst case is bounded by the min-on floor
+    and then the SoC budget instead.
+    """
+    d = _probe(current_a=6, battery_discharge_w=2000.0, probe_on_seconds=120.0)
+    assert d.current_a == 6
+
+
+def test_probe_holds_at_min_indefinitely_while_soc_stays_full() -> None:
+    """No maximum-on cap. With the battery full and PV clipped, discharging to
+    feed the car opens headroom the curtailed PV immediately refills, so the
+    deficit stays near zero and charging should never be interrupted.
+    """
+    for on_seconds in (700.0, 3600.0, 86400.0):
+        d = _probe(current_a=6, battery_discharge_w=2000.0,
+                   probe_on_seconds=on_seconds, soc_deficit_kwh=0.1)
+        assert d.current_a == 6
+
+
+def test_probe_stops_at_min_once_the_soc_budget_is_spent() -> None:
+    d = _probe(current_a=6, battery_discharge_w=2000.0,
+               probe_on_seconds=700.0, soc_deficit_kwh=1.2)
     assert d.current_a == 0
+
+
+def test_probe_soc_budget_does_not_override_the_min_on_floor() -> None:
+    """Ordering: the floor is checked first. Only the import escapes break it.
+    """
+    d = _probe(current_a=6, battery_discharge_w=2000.0,
+               probe_on_seconds=300.0, soc_deficit_kwh=1.2)
+    assert d.current_a == 6
+
+
+def test_probe_at_min_emits_zero_overshoot_count() -> None:
+    """cycles_overshooting governs one-amp steps above min only. A stale count
+    must not leak into a later above-min state.
+    """
+    d = _probe(current_a=6, battery_discharge_w=500.0, probe_on_seconds=120.0,
+               cycles_overshooting=1)
+    assert d.cycles_overshooting == 0
 
 
 def test_probe_steps_up_every_cycle() -> None:

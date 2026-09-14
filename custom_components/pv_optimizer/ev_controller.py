@@ -198,21 +198,31 @@ def decide_surplus_probe(
             return SurplusProbeDecision(current_a=0, cycles_since_up=0)
         return SurplusProbeDecision(current_a=new_a, cycles_since_up=0)
 
-    if (battery_discharge_w > PROBE_DISCHARGE_HARD_W
-            or grid_import_w > PROBE_IMPORT_CEILING_W):
-        return _step_down()
+    def _stop() -> SurplusProbeDecision:
+        return SurplusProbeDecision(current_a=0, cycles_since_up=0)
 
-    if battery_discharge_w > PROBE_DISCHARGE_CEILING_W:
-        sustained = cycles_overshooting + 1
-        if sustained >= PROBE_OVERSHOOT_SUSTAIN_CYCLES:
-            return _step_down()
-        return SurplusProbeDecision(current_a=current_a, cycles_since_up=0,
-                                    cycles_overshooting=sustained)
+    def _hold_at_min() -> SurplusProbeDecision:
+        return SurplusProbeDecision(current_a=min_a, cycles_since_up=0)
+
+    at_min = current_a == min_a
+
+    # --- Import escapes. Only meaningful while actually charging; they
+    # override the min-on floor because import is real money.
+    if current_a >= min_a:
+        if grid_import_w > probe.import_hard_w:
+            return _stop() if at_min else _step_down()
+        if grid_import_w > PROBE_IMPORT_CEILING_W:
+            if not at_min:
+                return _step_down()
+            if import_over_seconds >= PROBE_IMPORT_SUSTAIN_SECONDS:
+                return _stop()
+            # Sustain not met: fall through to the drain handling below, which
+            # holds at min. Never step up while importing.
 
     if current_a < min_a:
         # Not charging. Two gates before kicking to min.
         if probe_off_seconds < probe.restart_cooldown_seconds:
-            return SurplusProbeDecision(current_a=0, cycles_since_up=0)
+            return _stop()
         # Battery genuinely full again, not merely inside the hold budget.
         # The min() keeps this strictly tighter than the stop gate for every
         # configurable budget: soc_drop_kwh is a percentage of battery
@@ -220,8 +230,32 @@ def decide_surplus_probe(
         # the restart gate looser than the stop gate and re-create the chatter.
         restart_eps = min(SOC_FULL_EPS_KWH, probe.soc_drop_kwh / 2.0)
         if soc_deficit_kwh > restart_eps:
-            return SurplusProbeDecision(current_a=0, cycles_since_up=0)
+            return _stop()
         return SurplusProbeDecision(current_a=min_a, cycles_since_up=0)
+
+    over_soft = battery_discharge_w > PROBE_DISCHARGE_CEILING_W
+    over_hard = battery_discharge_w > PROBE_DISCHARGE_HARD_W
+    importing = grid_import_w > PROBE_IMPORT_CEILING_W
+
+    if at_min:
+        # No down-step exists here, so the only move is off. The discharge
+        # ceilings cannot tell "surplus arriving via the battery" from "the
+        # battery draining into the car" — only the SoC trend can.
+        if over_soft or importing:
+            if probe_on_seconds < probe.min_on_seconds:
+                return _hold_at_min()
+            if soc_deficit_kwh > probe.soc_drop_kwh:
+                return _stop()
+            return _hold_at_min()
+    else:
+        if over_hard:
+            return _step_down()
+        if over_soft:
+            sustained = cycles_overshooting + 1
+            if sustained >= PROBE_OVERSHOOT_SUSTAIN_CYCLES:
+                return _step_down()
+            return SurplusProbeDecision(current_a=current_a, cycles_since_up=0,
+                                        cycles_overshooting=sustained)
 
     can_step_up = (
         current_a < max_a
