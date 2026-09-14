@@ -7,6 +7,7 @@ implementations backed by ``hass``.
 from __future__ import annotations
 
 import logging
+import math
 import time as _time
 from dataclasses import dataclass, field, replace
 from datetime import datetime, time, timedelta, timezone
@@ -18,6 +19,7 @@ from .const import BAD_STATES as _BAD_STATES
 from .ev_controller import (
     DEFAULT_STATE_VOCAB,
     EVStateClass,
+    PROBE_IMPORT_CEILING_W,
     classify_state,
     decide_reactive,
     is_session_done,
@@ -78,6 +80,14 @@ class EVRuntimeState:
     probe_current_a: int = 0
     probe_cycles_since_up: int = 0
     probe_cycles_overshooting: int = 0
+    # Minimum-current dwell clocks. Seconds-based rather than cycle-based
+    # because charger_state_entity is a re-plan trigger, so every start/stop
+    # write fires an extra off-cadence tick.
+    probe_started_at: datetime | None = None   # 0 -> >=min transition
+    # NOT reset on disarm: a disarm/re-arm round trip must not launder the
+    # restart cooldown. Cleared only on disconnect.
+    probe_stopped_at: datetime | None = None
+    probe_import_over_since: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -830,6 +840,11 @@ class Planner:
         # or not it ever actually drew power.
         if mode != "car" or state_class == EVStateClass.DISCONNECTED:
             es.car_session_charging_seen = False
+        if state_class == EVStateClass.DISCONNECTED:
+            # New session on the next plug-in: don't inherit a stale cooldown.
+            es.probe_started_at = None
+            es.probe_stopped_at = None
+            es.probe_import_over_since = None
         # Car mode: planner stays out of the car's way — write max current,
         # active charger mode, and start switch every tick. Auto-return to
         # 'auto' is opt-in via switch.pv_optimizer_ev_car_auto_return; OFF
@@ -881,7 +896,7 @@ class Planner:
             self._write_ev_start(current > 0)
             return
         # Reactive path.
-        if self._run_surplus_probe(plan_first):
+        if self._run_surplus_probe(now, plan_first):
             return
         es.cheap_grid_active = price_buy <= cfg.params.buy_price_threshold
         if cfg.charger_mode_entity:
@@ -914,11 +929,15 @@ class Planner:
 
     # ---- EV helpers -------------------------------------------------------
 
-    def _run_surplus_probe(self, plan_first) -> bool:
+    def _run_surplus_probe(self, now: datetime, plan_first) -> bool:
         """If conditions warrant, take over surplus charging from the EVCS and
         return True (writes active charger mode if a charger_mode_entity is
         configured, regulated current, and start). Otherwise reset any probe
         state and return False so the caller's reactive path runs.
+
+        Owns the clock for the minimum-current dwell: converts the runtime
+        timestamps into elapsed-second scalars so ``decide_surplus_probe``
+        stays pure.
         """
         cfg = self.config.ev
         es = self.ev_state
@@ -949,21 +968,49 @@ class Planner:
                 es.probe_current_a = 0
                 es.probe_cycles_since_up = 0
                 es.probe_cycles_overshooting = 0
+                es.probe_started_at = None
+                es.probe_import_over_since = None
+                # probe_stopped_at deliberately survives: a disarm/re-arm
+                # round trip must not launder the restart cooldown.
             return False
+        grid_import_w = max(0.0, grid)
+        # Soft-import dwell: start the clock on the first tick over the
+        # ceiling, stop it the moment import falls back.
+        if grid_import_w > PROBE_IMPORT_CEILING_W:
+            if es.probe_import_over_since is None:
+                es.probe_import_over_since = now
+        else:
+            es.probe_import_over_since = None
         decision = decide_surplus_probe(
             battery_discharge_w=max(0.0, -batt),
-            grid_import_w=max(0.0, grid),
+            grid_import_w=grid_import_w,
             forecast_surplus_kw=forecast_surplus,
             current_a=es.probe_current_a,
             cycles_since_up=es.probe_cycles_since_up,
             cycles_overshooting=es.probe_cycles_overshooting,
+            probe_on_seconds=_elapsed_seconds(es.probe_started_at, now, 0.0),
+            # No recorded stop => no cooldown to serve. Zero would block the
+            # very first kick to min for a full cooldown window.
+            probe_off_seconds=_elapsed_seconds(
+                es.probe_stopped_at, now, math.inf),
+            import_over_seconds=_elapsed_seconds(
+                es.probe_import_over_since, now, 0.0),
+            soc_deficit_kwh=max(
+                0.0, self.config.battery.soc_max_kwh - soc_kwh),
             ev=cfg.params,
+            probe=cfg.probe,
         )
         # Mode first so any active/passive transition cache invalidation lands
         # before the (forced) current write.
         self._write_ev_charger_mode_active()
         self._write_ev_current(decision.current_a, force=True)
         self._write_ev_start(decision.current_a > 0)
+        # Dwell bookkeeping on the transitions, before committing the current.
+        if decision.current_a > 0 and es.probe_current_a == 0:
+            es.probe_started_at = now
+        elif decision.current_a == 0 and es.probe_current_a > 0:
+            es.probe_stopped_at = now
+            es.probe_started_at = None
         es.probe_armed = True
         es.probe_current_a = decision.current_a
         es.probe_cycles_since_up = decision.cycles_since_up
@@ -1075,6 +1122,18 @@ class Planner:
 def _floor_to_slot(now: datetime, slot_minutes: int) -> datetime:
     minute = (now.minute // slot_minutes) * slot_minutes
     return now.replace(minute=minute, second=0, microsecond=0)
+
+
+def _elapsed_seconds(since: datetime | None, now: datetime,
+                     default: float) -> float:
+    """Seconds from ``since`` to ``now``, or ``default`` when unset.
+
+    Clamped at zero so a clock step backwards can never read as a negative
+    dwell (which would satisfy every "dwell elapsed" comparison at once).
+    """
+    if since is None:
+        return default
+    return max(0.0, (now - since).total_seconds())
 
 
 def _parse_iso(s: str | datetime) -> datetime:

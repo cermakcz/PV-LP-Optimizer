@@ -2180,14 +2180,15 @@ def test_write_ev_current_force_bypasses_tolerance() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _probe_ev_cfg():
+def _probe_ev_cfg(**over):
     from custom_components.pv_optimizer.planner import EVConfig
-    from custom_components.pv_optimizer.models import EVParams
-    return EVConfig(
+    from custom_components.pv_optimizer.models import EVParams, SurplusProbeParams
+    kwargs = dict(
         params=EVParams(
             max_charging_power_kw=7.2, max_charging_current_a=32.0,
             min_charging_current_a=6.0, car_battery_kwh=60.0,
             current_tolerance_a=1.0, buy_price_threshold=0.0),
+        probe=SurplusProbeParams(),
         charger_state_entity="sensor.ev_state",
         charging_power_entity="sensor.ev_power",
         max_current_entity="number.ev_max_current",
@@ -2198,6 +2199,8 @@ def _probe_ev_cfg():
         deadline_entity="datetime.pv_optimizer_ev_deadline",
         planned_start_entity="datetime.pv_optimizer_ev_planned_start",
     )
+    kwargs.update(over)
+    return EVConfig(**kwargs)
 
 
 def _probe_states():
@@ -2281,21 +2284,108 @@ def test_probe_holds_then_steps_down_on_sustained_drain() -> None:
     assert p.ev_state.probe_cycles_overshooting == 0
 
 
-def test_probe_steps_to_zero_and_stops_on_overshoot() -> None:
+def test_probe_holds_at_min_through_drain_inside_the_floor() -> None:
+    # Past the hard ceiling, but inside the min-on floor: hold, don't stop.
     states = _probe_states()
-    # Past the hard ceiling -> immediate, no sustain wait.
     states["sensor.batt_w"] = StateView(state="-2000")
     p = Planner(_config(ev=_probe_ev_cfg(), battery_power_entity="sensor.batt_w"),
                 FakeReader(states), FakeCaller())
     p.ev_state.probe_armed = True
-    p.ev_state.probe_current_a = 6   # at min; one step down -> 0
+    p.ev_state.probe_current_a = 6
+    p.ev_state.probe_started_at = NOW - timedelta(seconds=60)
     p.step(NOW)
-    current_writes = [c for c in p.caller.calls if c[2].get("entity_id") == "number.ev_max_current"]
+    assert p.ev_state.probe_current_a == 6
+    starts = [c for c in p.caller.calls if c[2].get("entity_id") == "switch.ev_start"]
+    assert starts and starts[-1][1] == "turn_on"
+
+
+def test_probe_stops_at_min_past_floor_with_budget_spent() -> None:
+    # Test config: capacity 10.0 kWh, soc_max 9.0 kWh. 78 % => 7.8 kWh, a
+    # 1.2 kWh deficit: past the default 1.0 kWh budget, but still inside the
+    # 1.5 kWh disarm margin so the probe stays armed rather than handing back.
+    states = _probe_states()
+    states["sensor.batt_w"] = StateView(state="-2000")
+    states["sensor.soc_pct"] = StateView(state="78", attributes={})
+    p = Planner(_config(ev=_probe_ev_cfg(), battery_power_entity="sensor.batt_w"),
+                FakeReader(states), FakeCaller())
+    p.ev_state.probe_armed = True
+    p.ev_state.probe_current_a = 6
+    p.ev_state.probe_started_at = NOW - timedelta(seconds=1200)
+    p.step(NOW)
+    assert p.ev_state.probe_current_a == 0
+    assert p.ev_state.probe_armed is True   # still armed, just not charging
+    assert p.ev_state.probe_stopped_at == NOW
+    assert p.ev_state.probe_started_at is None
+    current_writes = [c for c in p.caller.calls
+                      if c[2].get("entity_id") == "number.ev_max_current"]
     starts = [c for c in p.caller.calls if c[2].get("entity_id") == "switch.ev_start"]
     assert current_writes and current_writes[-1][2]["value"] == 0
     assert starts and starts[-1][1] == "turn_off"
-    assert p.ev_state.probe_current_a == 0
-    assert p.ev_state.probe_armed is True   # still armed, just not charging
+
+
+def test_probe_records_started_at_on_kick_to_min() -> None:
+    states = _probe_states()
+    p = Planner(_config(ev=_probe_ev_cfg(), battery_power_entity="sensor.batt_w"),
+                FakeReader(states), FakeCaller())
+    p.step(NOW)
+    assert p.ev_state.probe_current_a == 6
+    assert p.ev_state.probe_started_at == NOW
+
+
+def test_probe_cooldown_survives_a_disarm_round_trip() -> None:
+    """The disarm block resets probe state; probe_stopped_at must be excluded
+    or a disarm/re-arm round trip launders the cooldown and the chatter simply
+    relocates to the arm boundary.
+    """
+    states = _probe_states()
+    p = Planner(_config(ev=_probe_ev_cfg(), battery_power_entity="sensor.batt_w"),
+                FakeReader(states), FakeCaller())
+    p.ev_state.probe_armed = True
+    p.ev_state.probe_current_a = 0
+    p.ev_state.probe_stopped_at = NOW - timedelta(seconds=60)
+    # Export re-enabled -> disarm.
+    states["sensor.sell"] = StateView(state="0.30", attributes={"today": [0.30] * 24})
+    p.step(NOW)
+    assert p.ev_state.probe_armed is False
+    assert p.ev_state.probe_stopped_at == NOW - timedelta(seconds=60)
+    # Export disabled again -> re-arm, but still inside the cooldown.
+    states["sensor.sell"] = StateView(state="-0.01", attributes={"today": [-0.01] * 24})
+    p.step(NOW + timedelta(seconds=120))
+    assert p.ev_state.probe_armed is True
+    assert p.ev_state.probe_current_a == 0   # cooldown still running
+
+
+def test_probe_timestamps_cleared_on_disconnect() -> None:
+    """A freshly plugged car should start promptly, not inherit a stale
+    cooldown from the previous session.
+    """
+    states = _probe_states()
+    states["sensor.ev_state"] = StateView(state="Disconnected")
+    p = Planner(_config(ev=_probe_ev_cfg(), battery_power_entity="sensor.batt_w"),
+                FakeReader(states), FakeCaller())
+    p.ev_state.probe_started_at = NOW - timedelta(seconds=60)
+    p.ev_state.probe_stopped_at = NOW - timedelta(seconds=60)
+    p.ev_state.probe_import_over_since = NOW - timedelta(seconds=60)
+    p.step(NOW)
+    assert p.ev_state.probe_started_at is None
+    assert p.ev_state.probe_stopped_at is None
+    assert p.ev_state.probe_import_over_since is None
+
+
+def test_probe_import_over_since_accumulates_and_resets() -> None:
+    states = _probe_states()
+    states["sensor.grid_w"] = StateView(state="800")   # above the soft ceiling
+    p = Planner(_config(ev=_probe_ev_cfg(), battery_power_entity="sensor.batt_w"),
+                FakeReader(states), FakeCaller())
+    p.ev_state.probe_armed = True
+    p.ev_state.probe_current_a = 6
+    p.ev_state.probe_started_at = NOW - timedelta(seconds=1200)
+    p.step(NOW)
+    assert p.ev_state.probe_import_over_since == NOW
+    assert p.ev_state.probe_current_a == 6   # sustain not met yet
+    states["sensor.grid_w"] = StateView(state="0")
+    p.step(NOW + timedelta(minutes=5))
+    assert p.ev_state.probe_import_over_since is None
 
 
 def test_probe_does_not_arm_inside_planned_start_gate() -> None:
