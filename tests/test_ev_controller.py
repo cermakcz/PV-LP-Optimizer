@@ -520,9 +520,17 @@ def test_should_probe_disarm_margin_tracks_the_hold_budget() -> None:
 # Task 4: decide_surplus_probe
 # ---------------------------------------------------------------------------
 
-# 7.2 kW / 32 A => 0.225 kW/A; min 6 A, max 32 A.
+# 7.2 kW / 32 A => 0.225 kW/A; min 6 A, max 32 A. Single-phase.
 _PROBE_EV = EVParams(
     max_charging_power_kw=7.2, max_charging_current_a=32.0,
+    min_charging_current_a=6.0, car_battery_kwh=60.0,
+)
+
+# 22 kW / 32 A => 0.6875 kW/A; min 6 A, max 32 A. Three-phase: the coarser
+# per-amp quantization at three-phase is the root cause of the min-current
+# dwell bug this effort fixes (see test_probe_does_not_chatter_across_ticks).
+_EV_3P = EVParams(
+    max_charging_power_kw=22.0, max_charging_current_a=32.0,
     min_charging_current_a=6.0, car_battery_kwh=60.0,
 )
 
@@ -820,10 +828,6 @@ def test_probe_does_not_chatter_across_ticks() -> None:
     charging against ~25 min off, which is expected (the SoC budget binds on
     a fixed schedule here), not chatter.
     """
-    ev_3p = EVParams(
-        max_charging_power_kw=22.0, max_charging_current_a=32.0,
-        min_charging_current_a=6.0, car_battery_kwh=60.0,
-    )
     probe = SurplusProbeParams(soc_drop_kwh=0.9)
     cycle_s, surplus_kw = 300.0, 3.0
 
@@ -833,7 +837,7 @@ def test_probe_does_not_chatter_across_ticks() -> None:
     runs: list[tuple[bool, int]] = []
 
     for _ in range(48):  # 4 hours at a 300 s cadence
-        draw_kw = current * ev_3p.kw_per_amp
+        draw_kw = current * _EV_3P.kw_per_amp
         drain_kw = max(0.0, draw_kw - surplus_kw)
         d = decide_surplus_probe(
             battery_discharge_w=drain_kw * 1000.0,
@@ -846,7 +850,7 @@ def test_probe_does_not_chatter_across_ticks() -> None:
             probe_off_seconds=off_s,
             import_over_seconds=0.0,
             soc_deficit_kwh=deficit,
-            ev=ev_3p,
+            ev=_EV_3P,
             probe=probe,
         )
         previous = current
@@ -898,7 +902,7 @@ def test_probe_does_not_chatter_across_ticks() -> None:
     # longer than that, which is what makes the SoC budget rather than the
     # instantaneous drain the thing that ends a session. The 1800 s (30 min)
     # bar is derived from this test's own fixture: measured runs are ~55 min
-    # at ev_3p / surplus_kw=3.0 / probe.soc_drop_kwh=0.9, comfortably above
+    # at _EV_3P / surplus_kw=3.0 / probe.soc_drop_kwh=0.9, comfortably above
     # both the ~15 min broken behaviour and this bar. Changing any of those
     # three values changes the measured run length and may require
     # revisiting this bar too -- otherwise such a change could silently
@@ -950,3 +954,39 @@ def test_probe_params_disarm_eps_is_derived_above_the_budget() -> None:
 def test_probe_params_rejects_non_positive(kwargs) -> None:
     with pytest.raises(ValueError):
         SurplusProbeParams(**kwargs)
+
+
+# ---------------------------------------------------------------------------
+# probe_floor_outspends_budget
+# ---------------------------------------------------------------------------
+
+from custom_components.pv_optimizer.ev_controller import (
+    probe_floor_outspends_budget,
+)
+
+# _EV_3P is defined above, near _PROBE_EV: 22 kW / 32 A => 0.6875 kW/A, so
+# 6 A is ~4.1 kW.
+
+
+def test_floor_outspends_budget_when_budget_is_small() -> None:
+    # 10 min at 4.125 kW = 0.69 kWh, which a 0.5 kWh budget cannot cover:
+    # the floor would decide every stop and the budget nothing.
+    assert probe_floor_outspends_budget(
+        ev=_EV_3P, probe=SurplusProbeParams(soc_drop_kwh=0.5)) is True
+
+
+def test_floor_within_budget_at_defaults_three_phase() -> None:
+    assert probe_floor_outspends_budget(
+        ev=_EV_3P, probe=SurplusProbeParams(soc_drop_kwh=1.0)) is False
+
+
+def test_floor_within_budget_single_phase() -> None:
+    # 7.2 kW / 32 A => 6 A is ~1.35 kW; 10 min is only 0.22 kWh.
+    assert probe_floor_outspends_budget(
+        ev=_PROBE_EV, probe=SurplusProbeParams(soc_drop_kwh=0.5)) is False
+
+
+def test_floor_outspends_budget_scales_with_the_floor() -> None:
+    assert probe_floor_outspends_budget(
+        ev=_EV_3P, probe=SurplusProbeParams(
+            min_on_seconds=1800.0, soc_drop_kwh=1.0)) is True

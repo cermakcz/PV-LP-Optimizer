@@ -273,6 +273,26 @@ def decide_surplus_probe(
                                 cycles_since_up=cycles_since_up + 1)
 
 
+def probe_floor_outspends_budget(*, ev, probe) -> bool:
+    """True when the min-on floor can spend more than the whole SoC budget.
+
+    The floor and the budget are sequential gates: the floor holds charging
+    unconditionally, then the budget decides. If a worst-case floor (PV
+    vanishing the instant charging starts) drains more than ``soc_drop_kwh``,
+    the budget never gets to decide anything and the floor silently becomes
+    the entire law.
+
+    Both values are user-configurable, so this is surfaced as a setup warning
+    rather than an error: the combination is legal and merely means the floor
+    dominates. Refusing to start over a tuning choice would be
+    disproportionate, and silently clamping would hide it.
+    """
+    worst_case_kwh = (probe.min_on_seconds
+                      * ev.min_charging_current_a
+                      * ev.kw_per_amp) / 3600.0
+    return worst_case_kwh > probe.soc_drop_kwh
+
+
 @dataclass(frozen=True)
 class ReactiveDecision:
     """Decision output for one planner tick (reactive branch)."""
