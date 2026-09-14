@@ -8,9 +8,9 @@ in a plain virtualenv.
 """
 from __future__ import annotations
 
-from .const import DOMAIN, PLATFORMS
-
 import logging
+
+from .const import DOMAIN, PLATFORMS
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -25,8 +25,10 @@ async def async_setup_entry(hass, entry):  # type: ignore[no-untyped-def]
     from .coordinator import LoadForecasterOptions, PvOptimizerCoordinator
     from .models import BatteryParams, EVParams, SurplusProbeParams
     from .ev_controller import (
+        PROBE_IMPORT_CEILING_W,
         probe_floor_outspends_budget,
         probe_floor_worst_case_kwh,
+        probe_import_hard_below_soft_ceiling,
     )
     from .planner import EVConfig, PlannerConfig, ev_replan_trigger_entities
     from . import const as C
@@ -110,6 +112,31 @@ async def async_setup_entry(hass, entry):  # type: ignore[no-untyped-def]
                 ev_probe.soc_drop_kwh,
                 C.CONF_EV_PROBE_MIN_ON_SECONDS,
                 C.CONF_EV_PROBE_SOC_DROP_PCT,
+            )
+        update_seconds = float(data[C.CONF_UPDATE_SECONDS])
+        for label, value, key in (
+            ("minimum-on floor", ev_probe.min_on_seconds,
+             C.CONF_EV_PROBE_MIN_ON_SECONDS),
+            ("restart cooldown", ev_probe.restart_cooldown_seconds,
+             C.CONF_EV_PROBE_RESTART_COOLDOWN_SECONDS),
+        ):
+            if value < update_seconds:
+                _LOGGER.warning(
+                    "EV surplus probe: the %s (%s = %.0f s) is shorter than the "
+                    "planner cadence (%.0f s), so it has no effect beyond the "
+                    "single cycle the planner already grants. Raise it above "
+                    "the cadence to make it meaningful.",
+                    label, key, value, update_seconds,
+                )
+        if probe_import_hard_below_soft_ceiling(probe=ev_probe):
+            _LOGGER.warning(
+                "EV surplus probe: the hard grid-import stop (%s = %.0f W) is "
+                "at or below the %.0f W soft ceiling, so any import over it "
+                "stops charging immediately instead of waiting out the sustain "
+                "window -- a brief household load can end a charging session. "
+                "Raise it above %.0f W.",
+                C.CONF_EV_PROBE_IMPORT_HARD_W, ev_probe.import_hard_w,
+                PROBE_IMPORT_CEILING_W, PROBE_IMPORT_CEILING_W,
             )
         ev_cfg = EVConfig(
             params=ev_params,

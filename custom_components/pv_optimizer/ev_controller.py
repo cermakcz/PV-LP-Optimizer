@@ -303,6 +303,16 @@ def probe_floor_outspends_budget(*, ev, probe) -> bool:
     return probe_floor_worst_case_kwh(ev=ev, probe=probe) > probe.soc_drop_kwh
 
 
+def probe_import_hard_below_soft_ceiling(*, probe) -> bool:
+    """True when the hard import threshold is at or below the soft ceiling.
+
+    The hard check runs first in ``decide_surplus_probe``, so such a setting
+    makes every soft-tier import stop charging at once, skipping the sustain
+    grace that keeps a kettle or an oven element from ending a session.
+    """
+    return probe.import_hard_w <= PROBE_IMPORT_CEILING_W
+
+
 @dataclass(frozen=True)
 class ReactiveDecision:
     """Decision output for one planner tick (reactive branch)."""

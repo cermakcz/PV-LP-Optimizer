@@ -175,8 +175,13 @@ _EV_SCHEMA = vol.Schema({
                  default=C.DEFAULT_EV_PROBE_RESTART_COOLDOWN_SECONDS): _num(30.0, 3600.0, 30.0, "s"),
     vol.Optional(C.CONF_EV_PROBE_SOC_DROP_PCT,
                  default=C.DEFAULT_EV_PROBE_SOC_DROP_PCT): _num(0.5, 50.0, 0.5, "%"),
+    # Lower bound sits above ev_controller.PROBE_IMPORT_CEILING_W (500 W): the
+    # hard check runs first, so a hard threshold at or below the soft ceiling
+    # would make every soft-tier import stop charging instantly, skipping the
+    # PROBE_IMPORT_SUSTAIN_SECONDS grace that stops a household transient from
+    # ending a charging session.
     vol.Optional(C.CONF_EV_PROBE_IMPORT_HARD_W,
-                 default=C.DEFAULT_EV_PROBE_IMPORT_HARD_W): _num(100.0, 20000.0, 100.0, "W"),
+                 default=C.DEFAULT_EV_PROBE_IMPORT_HARD_W): _num(600.0, 20000.0, 100.0, "W"),
 })
 
 

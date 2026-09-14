@@ -142,9 +142,12 @@ DEFAULT_EV_SESSION_DONE_SECONDS = 60.0
 DEFAULT_EV_PROBE_MIN_ON_SECONDS = 300.0
 DEFAULT_EV_PROBE_RESTART_COOLDOWN_SECONDS = 600.0
 # Percent of battery capacity, converted to kWh in __init__.py -- matches the
-# other SoC fields on the form. 6 % of a 10-20 kWh battery is ~0.6-1.2 kWh,
-# putting the stop threshold around 94 % of soc_max and the restart at ~98 %.
-# Both are offsets below the configured soc_max, not absolute SoC.
+# other SoC fields on the form. Measured against capacity rather than soc_max
+# on purpose: HA's SoC sensor also reports percent of capacity, so this value
+# is exactly the percentage-point drop the user sees on that sensor. With
+# soc_max_pct at 80, a 6 % band means "stop when SoC reads 74 %". Measured
+# against soc_max instead it would be 4.8 points, which matches nothing on
+# screen. Both thresholds are offsets below soc_max, not absolute SoC.
 DEFAULT_EV_PROBE_SOC_DROP_PCT = 6.0
 DEFAULT_EV_PROBE_IMPORT_HARD_W = 2000.0
 # EVCS HACS uses "Manual"/"Auto"; users with other chargers override

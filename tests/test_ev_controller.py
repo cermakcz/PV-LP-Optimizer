@@ -963,6 +963,7 @@ def test_probe_params_rejects_non_positive(kwargs) -> None:
 from custom_components.pv_optimizer.ev_controller import (
     probe_floor_outspends_budget,
     probe_floor_worst_case_kwh,
+    probe_import_hard_below_soft_ceiling,
 )
 
 # _EV_3P is defined above, near _PROBE_EV: 22 kW / 32 A => 0.6875 kW/A, so
@@ -1012,3 +1013,30 @@ def test_floor_exactly_equal_to_budget_is_not_outspending() -> None:
     exact = probe_floor_worst_case_kwh(ev=_EV_3P, probe=SurplusProbeParams())
     assert probe_floor_outspends_budget(
         ev=_EV_3P, probe=SurplusProbeParams(soc_drop_kwh=exact)) is False
+
+
+# ---------------------------------------------------------------------------
+# probe_import_hard_below_soft_ceiling
+# ---------------------------------------------------------------------------
+
+
+def test_import_hard_below_soft_ceiling_when_lower() -> None:
+    assert probe_import_hard_below_soft_ceiling(
+        probe=SurplusProbeParams(import_hard_w=400.0)) is True
+
+
+def test_import_hard_below_soft_ceiling_boundary_is_inclusive() -> None:
+    # <=, not <: at exactly the soft ceiling the hard check still wins first
+    # in decide_surplus_probe, so equality is still a misconfiguration.
+    assert probe_import_hard_below_soft_ceiling(
+        probe=SurplusProbeParams(import_hard_w=500.0)) is True
+
+
+def test_import_hard_above_soft_ceiling_is_fine() -> None:
+    assert probe_import_hard_below_soft_ceiling(
+        probe=SurplusProbeParams(import_hard_w=600.0)) is False
+
+
+def test_import_hard_at_default_is_fine() -> None:
+    assert probe_import_hard_below_soft_ceiling(
+        probe=SurplusProbeParams()) is False
