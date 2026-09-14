@@ -89,7 +89,7 @@ Five steps in the UI:
 | Battery  | Usable capacity (kWh), SoC min/max %, max charge/discharge power (kW), round-trip efficiencies, **cycle cost in your currency / kWh delivered out of the battery** — LCOS convention, booked on the discharge leg (≈ `battery_price / (cycles × usable_kWh × η_rt)`), optional **soft SoC health floor (%)** and **low-SoC dwell penalty (currency / kWh / h)** — see *Soft SoC health floor* below. |
 | Solver   | Slot length (default 60 min), horizon (default 24 h), update interval (default 5 min), max grid import/export (kW), set-point write tolerance (W), **minimum sell price (currency/kWh; default 0)** — see *Minimum sell price* below. |
 | Load forecast | Lookback days (default 7), optional cap (kW; 0 = no cap), weekday-aware mode (default off). Skipped at runtime when an external `load_forecast_entity` was set in the Entities step. |
-| EV charging | All optional — leave blank to disable the feature entirely. Charger entity IDs (state, charging power, optional session energy, max-current `number`, optional start `switch`, optional native-mode entity + its *active* / *passive* option strings) and the static parameters (max charging power kW, max charging current A, min current A, cheap-grid price threshold, car battery kWh, current write tolerance, session-done power/duration). See *EV charging* below. |
+| EV charging | All optional — leave blank to disable the feature entirely. Charger entity IDs (state, charging power, optional session energy, max-current `number`, optional start `switch`, optional native-mode entity + its *active* / *passive* option strings) and the static parameters (max charging power kW, max charging current A, min current A, cheap-grid price threshold, car battery kWh, current write tolerance, session-done power/duration), plus the curtailed-surplus probe's minimum-on floor, restart cooldown, SoC-drop budget and hard import threshold. See *EV charging* below. |
 
 Options flow re-exposes **every** knob — entities, battery, solver,
 load-forecast and EV — in a single combined screen (pre-filled with current
@@ -375,8 +375,9 @@ every tick, and give an amp back when it has clearly gone too far. It rests one
 amp *below* the true surplus on purpose — leaving a fraction of an amp of free
 solar unused is the cheap mistake; paying for grid is not.
 
-Backing off is deliberately two-speed, because "the battery is discharging a
-bit" and "the battery is emptying into the car" want different reactions:
+Backing off is deliberately two-speed **above minimum current** — that is,
+while there's still an amp to give back — because "the battery is discharging
+a bit" and "the battery is emptying into the car" want different reactions:
 
 | Signal | Reaction |
 |---|---|
@@ -388,8 +389,91 @@ The middle row is what keeps the probe from getting spooked: a kettle switching
 on, a brief cloud, or simply the tick right after a step-up (before the inverter
 has unclipped production to match) all look like a small drain for a moment.
 Waiting one tick rides those out, while a genuine collapse still gets caught on
-the very next tick by the hard threshold. Worst case the house battery gives up
-roughly 250 Wh before the regulator corrects.
+the very next tick by the hard threshold. Worst case, above minimum current,
+the house battery gives up roughly 250 Wh before the regulator corrects.
+
+At minimum current there's no amp left to give back, so a different set of
+rules takes over — see the next section.
+
+#### At minimum current: a floor and a budget, not a discharge test
+
+Everything above assumes a down-step is available. At the charger's minimum
+current there isn't one — the only move left is to stop entirely. That makes
+stopping cheap to trigger and expensive in effect: it cycles the car's charge
+connector and throws away charging time you'd otherwise keep.
+
+On three phases the minimum current is a big step: 6 A is roughly 4.1 kW,
+routinely *more* than the curtailed surplus you're actually harvesting. So the
+discharge test above could never be satisfied down there — the probe would
+step to minimum, immediately trip the drain check, stop, and find itself armed
+again on the very next tick. What that looked like in practice: about 15
+minutes of charging, a cycle off, repeat, for as long as the sun held.
+
+Discharge is also the wrong instrument at minimum for a subtler reason: with
+the house battery full and PV clipped, discharging the battery to feed the car
+opens headroom that the clipped PV immediately refills. "Absorbing curtailed
+surplus" and "draining the battery into the car" look identical to a power
+sensor in that state — only the battery's SoC *trend* tells them apart.
+
+So at minimum current, two different things decide the stop instead:
+
+- **A floor.** Charging runs for at least `ev_probe_min_on_seconds` (default
+  300 s) before a stop is even considered — connector protection, plain and
+  simple.
+- **A budget.** Past the floor, charging keeps going while the SoC stays
+  within `ev_probe_soc_drop_pct` (default `6`, i.e. 6% of battery capacity) of
+  `soc_max`. There's deliberately no maximum-on cap — while the surplus
+  roughly covers the car, charging just continues.
+
+Restarting after a stop needs **both** `ev_probe_restart_cooldown_seconds`
+(default 600 s) to have elapsed *and* the battery to be genuinely full again
+— not merely back inside the hold budget. That combination is what turns a
+sunless spell into one bounded drain event instead of a repeating one: if
+there's no surplus, the battery never refills, so the probe just stays off
+until there is.
+
+Grid import still overrides all of this, because import is real money:
+immediately above `ev_probe_import_hard_w` (default 2000 W), and above the
+500 W soft ceiling once it's persisted for about ten minutes. That sustain
+window is what stops a kettle or an oven element from ending a charging
+session outright.
+
+| Field | Default | Meaning |
+|---|---|---|
+| `ev_probe_min_on_seconds` | `300` | Minimum charging time at minimum current before a stop is considered |
+| `ev_probe_restart_cooldown_seconds` | `600` | Minimum pause after the probe stops |
+| `ev_probe_soc_drop_pct` | `6` | SoC deficit below `soc_max`, as a percent of battery capacity, that ends a minimum-current hold |
+| `ev_probe_import_hard_w` | `2000` | Grid import that stops charging at once, overriding the minimum-on floor |
+
+Two things worth knowing before you tune these. First, the SoC band is a
+percent of battery **capacity**, deliberately — Home Assistant's SoC sensor
+also reports percent of capacity, so a 6% band is exactly a 6-percentage-point
+drop on that same sensor. With `soc_max_pct` at 80, that means "stop when SoC
+reads 74%". Second, the response is close to linear: doubling
+`ev_probe_soc_drop_pct` roughly doubles how long a charging run lasts, and
+halving it halves it.
+
+The integration also logs a setup warning if it spots one of three likely
+misconfigurations: a minimum-on floor whose worst case would drain more than
+the whole SoC budget (which makes the budget dead code — the floor alone ends
+up deciding everything); either dwell set below the planner's update
+interval (below that, it has no effect beyond the one cycle the planner
+already grants); or a hard import threshold at or below the 500 W soft
+ceiling (which skips the ten-minute sustain window entirely).
+
+Here's what this buys you, measured against the actual decision logic rather
+than guessed at: with 3 kW of curtailed surplus (the case that motivated this
+work), sessions now run roughly 55 minutes charging to 25 minutes paused,
+repeating — one connector cycle every ~80 minutes instead of one every ~15.
+If the sun genuinely disappears, you get one bounded drain event and then
+nothing until the battery refills. And once the surplus covers the car
+outright (≥ 4.1 kW on three phases), the probe never even reaches minimum —
+it steps up past it, so none of this applies. Be clear about what that is and
+isn't: cycling is reduced and bounded, not eliminated. Below the
+minimum-current quantum some cycling is unavoidable — the charger's minimum
+is a large step, and closing that gap fully would mean duty-cycling the
+current below the minimum itself, which is a bigger change this design
+deliberately leaves alone.
 
 This needs the optional **battery power** entity (signed, negative =
 discharging) wired up in the Entities step. Without it the probe stays off

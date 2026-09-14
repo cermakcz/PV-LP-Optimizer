@@ -191,7 +191,11 @@ Single flow, five steps:
    current (A, default 6), cheap-grid buy-price threshold (default 0), car
    battery capacity (kWh), current write tolerance (A, default 1),
    session-done power (W, default 100) and session-done duration (s,
-   default 60).
+   default 60). Also the curtailed-surplus probe's four minimum-current
+   dwell parameters (§9.6): `ev_probe_min_on_seconds` (default `300`),
+   `ev_probe_restart_cooldown_seconds` (default `600`),
+   `ev_probe_soc_drop_pct` (default `6`) and `ev_probe_import_hard_w`
+   (default `2000`).
 
 The EV feature activates only when **all six** required pieces are present:
 charger-state entity, charging-power entity, max-current entity, max charging
@@ -682,11 +686,13 @@ and the planner falls back to passive handback. The reading is normalised to a
 discharge-positive magnitude (`max(0, −value)`) so a sign or unit mismatch
 cannot silently read as "not discharging".
 
-**Control law** (stateful, unlike the stateless reactive decision). Per cycle:
+**Control law** (stateful, unlike the stateless reactive decision). This table
+governs while `current_a > min_a`, i.e. while a down-step is available. Per
+cycle:
 
 | Direction | Rule |
 |---|---|
-| **Down, immediate** | Battery discharge > `PROBE_DISCHARGE_HARD_W` *or* grid import > `PROBE_IMPORT_CEILING_W` → step down 1 A now. Below `min_a` → command 0 and stay armed, waiting for more sun. |
+| **Down, immediate** | Battery discharge > `PROBE_DISCHARGE_HARD_W` *or* grid import > `PROBE_IMPORT_CEILING_W` → step down 1 A now. Stepping to `min_a` or below hands off to the minimum-current branch described below, rather than commanding 0 and restarting on the next armed cycle. |
 | **Down, sustained** | Battery discharge in the *soft band* (`PROBE_DISCHARGE_CEILING_W` … hard) → hold and count. Step down only once the drain has persisted `PROBE_OVERSHOOT_SUSTAIN_CYCLES` consecutive cycles. Any clean cycle resets the counter. |
 | **Up** (speculative) | 1 A every `PROBE_UP_INTERVAL_CYCLES`, only while not overshooting, below `max_a`, and the next amp still fits the forecast headroom. |
 | **Rest** | Otherwise hold and advance the up-counter. |
@@ -722,6 +728,88 @@ counter now absorbs the noise the rate limit used to. Note the phase wrinkle:
 at ~0.69 kW/A three-phase the effective rest band is wider than single-phase's
 ~0.23 kW/A, so more free solar is left on the table.
 
+**At minimum current, the control law above does not apply.** There is no
+down-step below `min_a`, so the only remaining action is to stop entirely.
+The discharge ceilings are also the wrong instrument in this regime: with the
+battery full and PV clipped, discharging it to feed the car opens headroom
+that the clipped PV immediately refills, so absorption of curtailed surplus
+and drain into the car are indistinguishable to a power sensor — only the
+SoC *trend* separates them. (This holds only while available surplus is
+below the EV's draw at `min_a`; once surplus at or above that level exists,
+the probe steps *up* past minimum and the control law above governs again.)
+
+On a three-phase installation `min_a` is a large step — 6 A ≈ 4.1 kW — that
+routinely exceeds the curtailed surplus available. Under a discharge-only
+test this branch could never be satisfied: the probe would step to minimum,
+immediately trip the drain check, stop, and re-arm on the very next cycle.
+Observed: roughly 15 minutes of charging per cycle.
+
+The stop and restart at minimum current are governed by four config-flow
+fields, held in `SurplusProbeParams`:
+
+| Config key | Attribute | Default | Role |
+|---|---|---|---|
+| `ev_probe_min_on_seconds` | `min_on_seconds` | `300` s | Floor: holding at `min_a` runs at least this long before a stop is considered, independent of discharge. |
+| `ev_probe_soc_drop_pct` | `soc_drop_kwh` (derived: `capacity_kwh × pct / 100`) | `6` % | Budget: past the floor, the hold continues while the SoC deficit below `soc_max` stays within this many kWh. No maximum-on cap — while surplus roughly covers the car, the hold does not end on its own. |
+| `ev_probe_restart_cooldown_seconds` | `restart_cooldown_seconds` | `600` s | Floor on off-time: a stopped probe will not restart before this elapses. |
+| `ev_probe_import_hard_w` | `import_hard_w` | `2000` W | Immediate stop on grid import, overriding the min-on floor — import is real money regardless of dwell state. |
+
+Restarting from 0 to `min_a` requires **both** gates to hold:
+`restart_cooldown_seconds` has elapsed, *and* the battery is genuinely full
+again — `soc_deficit_kwh ≤ restart_eps`, not merely back inside the hold
+budget. Neither gate alone suffices: cooldown alone would restart into an
+undercharged battery and immediately re-trip the budget; a full-battery check
+alone would restart the instant the sun blipped, defeating the cooldown's
+damping.
+
+`restart_eps = min(SOC_FULL_EPS_KWH, soc_drop_kwh / 2)`. The `min()` matters
+because `soc_drop_kwh` reaches this code as a percentage of pack capacity
+(`ev_probe_soc_drop_pct`): on a small enough battery, a modest percentage can
+fall below the fixed `SOC_FULL_EPS_KWH` (`0.2` kWh) arm epsilon. Without the
+`min()`, such a config would make the restart gate *looser* than the stop
+gate, reopening the original chatter through the configuration surface even
+though the code path that caused it is fixed. The derived thresholds must
+satisfy, and do:
+
+```
+restart_eps < soc_drop_kwh < soc_disarm_eps_kwh
+```
+
+where `soc_disarm_eps_kwh = soc_drop_kwh + 0.5` kWh — the disarm margin from
+**Arming** above (`SOC_DISARM_EPS_KWH` in the stateless case) is widened to
+track the configured budget, so the probe's own hold cannot self-disarm
+mid-hold.
+
+Grid import above `PROBE_IMPORT_CEILING_W` (the same 500 W soft ceiling used
+above minimum) also ends the hold at minimum current, but only once it has
+persisted `PROBE_IMPORT_SUSTAIN_SECONDS` (`600` s default) — the same sustain
+principle as the discharge soft band above minimum, so a brief household load
+does not end a session. Import above `import_hard_w` stops immediately,
+bypassing both the sustain window and the min-on floor.
+
+**Outcome.** Measured against the decision function directly (three-phase
+22 kW / 32 A charger, so `min_a` = 6 A ≈ 4.125 kW; 15 kWh battery; defaults
+above; 300 s planner cadence): at 3 kW of curtailed surplus, sessions run
+approximately 55 minutes on to 25 minutes off, repeating — one connector
+cycle roughly every 80 minutes, versus one every ~15 minutes under the
+discharge-only test. With no surplus at all, one bounded drain event occurs
+and charging then stays off until the battery refills. With surplus at or
+above the minimum-current quantum, no drain occurs at all — the probe steps
+up past minimum. This reduces and bounds cycling; it does not eliminate it.
+Below the minimum-current quantum, some cycling is unavoidable — closing that
+gap fully would require duty-cycling the current below `min_a`
+(sub-minimum-current modulation), which this design's own scope notes rule
+out as a separate, larger change.
+
+At setup, the integration logs a warning for three configurations it can
+detect as likely mistakes: `min_on_seconds`'s worst case exceeding the whole
+`soc_drop_kwh` budget (`probe_floor_outspends_budget` — the budget would
+never bind, so the floor alone decides everything); either `min_on_seconds`
+or `restart_cooldown_seconds` set below the planner's update interval (no
+effect beyond the single cycle the planner already grants); and
+`import_hard_w` at or below `PROBE_IMPORT_CEILING_W`
+(`probe_import_hard_below_soft_ceiling` — skips the sustain window entirely).
+
 **Disarming** happens as soon as any arm condition fails — export re-enabled,
 battery no longer full, car gone — whereupon the planner writes the passive
 option to hand back to the charger and resets probe state. No stickiness is
@@ -741,6 +829,7 @@ derived from `kw_per_amp`):
 | `PROBE_IMPORT_CEILING_W` | `500` W (immediate step-down) |
 | `PROBE_UP_INTERVAL_CYCLES` | `1` (step up every cycle) |
 | `PROBE_OVERSHOOT_SUSTAIN_CYCLES` | `2` (~10 min at the default 300 s cadence) |
+| `PROBE_IMPORT_SUSTAIN_SECONDS` | `600` s (grace before soft-ceiling import stops the minimum-current hold) |
 
 ### 9.7 Write discipline and on-demand re-plan
 Throughout §9, writes to the two *optional* outputs — the start switch and the
