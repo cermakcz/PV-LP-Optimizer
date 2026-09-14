@@ -367,6 +367,30 @@ MSG
 
 Split into three tasks (3, 4, 5) by branch so each is independently testable. This one covers branch 2 of the spec: leaving zero.
 
+> **Correction applied during execution — expected red suite for Tasks 3-6.**
+> The four new required parameters on `decide_surplus_probe` break
+> `planner.py`'s call site, exactly as Task 2 broke the `should_probe_surplus`
+> call site. Unlike Task 2 this cannot be cheaply forward-pulled: repairing it
+> needs the `EVRuntimeState` timestamps, `_elapsed_seconds`, and `now`
+> threading — essentially all of Task 7's implementation.
+>
+> So `tests/test_planner.py` is **expected to fail** from Task 3 until Task 7
+> closes the call site. Do NOT give the new parameters defaults to paper over
+> this: silently defaulting a clock value would let a wiring bug ship.
+>
+> **Verification rule for Tasks 3-6 in place of "full suite green":**
+> 1. `.venv/bin/python -m pytest tests/test_ev_controller.py -q` MUST be fully
+>    green. This is where all the changing logic lives.
+> 2. `tests/test_planner.py` failures must be **exactly** the known set — same
+>    node IDs, same `TypeError: decide_surplus_probe() missing N required
+>    keyword-only arguments` signature. The controller records the baseline set
+>    after Task 3 and diffs it after each later task; any new or different
+>    failure is a regression, not expected breakage.
+>
+> This is acceptable because Tasks 3-6 change only pure logic in
+> `ev_controller.py`, which `tests/test_ev_controller.py` covers completely.
+> The planner tests cover wiring, which does not change until Task 7.
+
 **Files:**
 - Modify: `custom_components/pv_optimizer/ev_controller.py` (`decide_surplus_probe`)
 - Test: `tests/test_ev_controller.py:503-595`
