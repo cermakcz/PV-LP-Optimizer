@@ -1387,6 +1387,42 @@ These three files are HA-only and not unit-tested in this repo by design (see th
 - Modify: `custom_components/pv_optimizer/config_flow.py:136-174` (`_EV_SCHEMA`)
 - Modify: `custom_components/pv_optimizer/__init__.py:58-98`
 
+> **Correction applied during execution — the 600 s floor default makes the 6%
+> budget default dead code on small batteries.** Checking
+> `probe_floor_outspends_budget` against real configurations:
+>
+> | Budget | kWh | Floor outspends it? |
+> |---|---|---|
+> | 0.5% of 15 kWh | 0.07 | yes |
+> | 4% of 15 kWh | 0.60 | yes |
+> | 6% of 15 kWh | 0.90 | no |
+> | **6% of 10 kWh** | **0.60** | **yes** |
+>
+> The three-phase worst case is `600 s x 6 A x 0.6875 kW/A / 3600 = 0.6875 kWh`,
+> so a 6% budget only clears it above ~11.5 kWh of capacity. Stock defaults
+> would therefore fire the warning for a large class of users, which destroys
+> its value as a signal — if defaults warn, either the default or the warning is
+> wrong.
+>
+> **So this task must also lower the min-on floor default from 600 s to 300 s**
+> (worst case 0.34 kWh, self-consistent above ~5.7 kWh of capacity). Raising the
+> budget instead was rejected: it would enlarge the battery bite per drain event,
+> whereas lowering the floor costs nothing in practice — the floor only binds in
+> the pathological "PV vanished the instant charging started" case, while the SoC
+> budget is what produces the measured 55-minute runs.
+>
+> Three places change together:
+> 1. `DEFAULT_EV_PROBE_MIN_ON_SECONDS = 300.0` in `const.py` (below).
+> 2. `SurplusProbeParams.min_on_seconds` default 600.0 -> 300.0 in `models.py`,
+>    so the dataclass and the form agree.
+> 3. `test_probe_params_defaults` in `tests/test_ev_controller.py` asserts
+>    `min_on_seconds == 600.0` — update it to 300.0.
+>
+> At a 300 s cadence a 300 s floor still guarantees a full cycle of charging
+> before any stop, which is all that is needed to prevent per-tick chatter. The
+> chatter test's `min(on_runs) >= probe.min_on_seconds` assertion still holds
+> (runs are 55 min), and its 1800 s bar is unaffected.
+
 - [ ] **Step 1: Add the config keys**
 
 In `const.py`, add to the EV configuration-keys block, after `CONF_EV_SESSION_DONE_SECONDS`:
