@@ -2225,6 +2225,30 @@ def _probe_states():
     return states
 
 
+def _seed_live_probe_session(p: Planner, *, stopped_at: datetime) -> None:
+    """Put the probe in a mid-session state: armed, charging, clocks running.
+
+    Used to prove a bypass path resets the in-progress session rather than
+    merely being a no-op against already-default fields.
+    """
+    p.ev_state.probe_armed = True
+    p.ev_state.probe_current_a = 6
+    p.ev_state.probe_started_at = NOW - timedelta(seconds=120)
+    p.ev_state.probe_import_over_since = NOW - timedelta(seconds=60)
+    p.ev_state.probe_stopped_at = stopped_at
+
+
+def _assert_session_cleared_cooldown_kept(p: Planner, *, stopped_at: datetime) -> None:
+    es = p.ev_state
+    assert es.probe_armed is False
+    assert es.probe_current_a == 0
+    assert es.probe_started_at is None
+    assert es.probe_import_over_since is None
+    # The restart cooldown must survive a bypass -- clearing it would launder
+    # the cooldown and let the probe kick straight to min on return.
+    assert es.probe_stopped_at == stopped_at
+
+
 def test_probe_arms_and_drives_manual_in_reactive_branch() -> None:
     states = _probe_states()
     p = Planner(_config(ev=_probe_ev_cfg(), battery_power_entity="sensor.batt_w"),
@@ -2481,3 +2505,75 @@ def test_probe_sequential_ticks_compose_a_run_a_cooldown_and_a_restart() -> None
     assert off_run_seconds >= default_probe.restart_cooldown_seconds
     assert p.ev_state.probe_armed is True   # never disarmed across the run
     assert p.ev_state.probe_started_at == NOW + timedelta(seconds=1500)
+
+
+# ---------------------------------------------------------------------------
+# Bypass-path regression tests: each of these paths returns before
+# _run_surplus_probe ever runs, so the ORIGINAL reset inside that method
+# cannot reach a session started under one of them. Each seeds a live
+# in-progress session first and confirms _reset_probe_session() actually
+# fires -- and that probe_stopped_at (the restart cooldown's clock) survives,
+# not just that the fields go back to their defaults.
+# ---------------------------------------------------------------------------
+
+
+def test_probe_session_reset_in_car_mode() -> None:
+    states = _probe_states()
+    states["select.pv_optimizer_ev_mode"] = StateView(state="car")
+    p = Planner(_config(ev=_probe_ev_cfg(), battery_power_entity="sensor.batt_w"),
+                FakeReader(states), FakeCaller())
+    stopped_at = NOW - timedelta(seconds=1000)
+    _seed_live_probe_session(p, stopped_at=stopped_at)
+    p.step(NOW)
+    _assert_session_cleared_cooldown_kept(p, stopped_at=stopped_at)
+
+
+def test_probe_session_reset_in_off_mode() -> None:
+    states = _probe_states()
+    states["select.pv_optimizer_ev_mode"] = StateView(state="off")
+    # Keep the charger connected. Disconnected would hit the disconnect
+    # check (which runs ahead of the mode gate) and clear probe_stopped_at
+    # too via _clear_probe_session_clocks(), making this test pass for the
+    # wrong reason.
+    p = Planner(_config(ev=_probe_ev_cfg(), battery_power_entity="sensor.batt_w"),
+                FakeReader(states), FakeCaller())
+    stopped_at = NOW - timedelta(seconds=1000)
+    _seed_live_probe_session(p, stopped_at=stopped_at)
+    p.step(NOW)
+    _assert_session_cleared_cooldown_kept(p, stopped_at=stopped_at)
+
+
+def test_probe_session_reset_when_lp_plans_charging() -> None:
+    states = _probe_states()
+    # Cheap slot 0 relative to the rest of the day, a non-zero target, and a
+    # reachable deadline -- the LP plans EV charging in slot 0 (mirrors
+    # test_planner_engages_lp_when_target_and_deadline_set).
+    states["sensor.buy"] = StateView(
+        state="0.05", attributes={"today": [0.05] + [0.30] * 23})
+    states["number.pv_optimizer_ev_target_kwh"] = StateView(state="5")
+    deadline = (NOW + timedelta(hours=3)).isoformat() + "+00:00"
+    states["datetime.pv_optimizer_ev_deadline"] = StateView(state=deadline)
+    p = Planner(_config(ev=_probe_ev_cfg(), battery_power_entity="sensor.batt_w"),
+                FakeReader(states), FakeCaller())
+    stopped_at = NOW - timedelta(seconds=1000)
+    _seed_live_probe_session(p, stopped_at=stopped_at)
+    cycle = p.step(NOW)
+    assert cycle.result is not None
+    assert cycle.result.slots[0].p_ev_chg_kw > 0   # confirms the LP branch ran
+    _assert_session_cleared_cooldown_kept(p, stopped_at=stopped_at)
+
+
+def test_probe_session_reset_in_planned_start_gate() -> None:
+    states = _probe_states()
+    states["number.pv_optimizer_ev_target_kwh"] = StateView(state="5")
+    deadline = (NOW + timedelta(hours=3)).isoformat() + "+00:00"
+    states["datetime.pv_optimizer_ev_deadline"] = StateView(state=deadline)
+    planned_start = (NOW + timedelta(hours=2)).isoformat() + "+00:00"
+    states["datetime.pv_optimizer_ev_planned_start"] = StateView(state=planned_start)
+    p = Planner(_config(ev=_probe_ev_cfg(), battery_power_entity="sensor.batt_w"),
+                FakeReader(states), FakeCaller())
+    stopped_at = NOW - timedelta(seconds=1000)
+    _seed_live_probe_session(p, stopped_at=stopped_at)
+    p.step(NOW)
+    # Gate behavior (idle handback) wins; probe session reset.
+    _assert_session_cleared_cooldown_kept(p, stopped_at=stopped_at)
