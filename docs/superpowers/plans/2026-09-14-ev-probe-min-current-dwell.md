@@ -274,9 +274,10 @@ In `custom_components/pv_optimizer/ev_controller.py`, delete the `SOC_DISARM_EPS
 ```python
 # --- Curtailed-surplus probe (see specs/2026-06-23-ev-curtailed-surplus-probe
 # and specs/2026-09-14-ev-probe-min-current-dwell) ---
-# All tunable; initial values to validate empirically. The minimum-current
-# dwell knobs live on models.SurplusProbeParams (user-configurable); the
-# constants here govern one-amp steps above minimum current.
+# All tunable; initial values to validate empirically. The split is
+# configurability, not current level: knobs users are expected to tune live
+# on models.SurplusProbeParams and reach the config form, while the values
+# here are internal tuning that stays in code.
 SOC_FULL_EPS_KWH = 0.2        # how close to soc_max counts as "full" (arm)
 PROBE_FORECAST_MARGIN_KW = 0.5  # forecast surplus must exceed this to arm
 PROBE_DISCHARGE_CEILING_W = 300.0  # soft band floor: sustained drain steps down
