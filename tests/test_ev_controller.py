@@ -535,7 +535,12 @@ def _probe(**over):
         current_a=0,
         cycles_since_up=0,
         cycles_overshooting=0,
+        probe_on_seconds=0.0,
+        probe_off_seconds=float("inf"),
+        import_over_seconds=0.0,
+        soc_deficit_kwh=0.0,
         ev=_PROBE_EV,
+        probe=SurplusProbeParams(),
     )
     base.update(over)
     return decide_surplus_probe(**base)
@@ -545,6 +550,58 @@ def test_probe_kicks_to_min_when_not_charging() -> None:
     d = _probe(current_a=0)
     assert d.current_a == 6
     assert d.cycles_since_up == 0
+
+
+def test_probe_kicks_to_min_when_never_stopped() -> None:
+    """probe_off_seconds is infinite when there is no recorded stop. A
+    never-stopped probe has no cooldown to serve, so the very first kick to
+    minimum must not be delayed.
+    """
+    d = _probe(current_a=0, probe_off_seconds=float("inf"))
+    assert d.current_a == 6
+
+
+def test_probe_restart_blocked_during_cooldown() -> None:
+    """The fix for the reported chatter: after a stop the probe must not kick
+    straight back to minimum on the next tick.
+    """
+    d = _probe(current_a=0, probe_off_seconds=60.0)
+    assert d.current_a == 0
+
+
+def test_probe_restart_allowed_after_cooldown() -> None:
+    d = _probe(current_a=0, probe_off_seconds=601.0)
+    assert d.current_a == 6
+
+
+def test_probe_restart_blocked_until_battery_full_again() -> None:
+    """Cooldown elapsed is not enough. The battery must be genuinely full
+    again (the arm epsilon, not the looser hold budget) — otherwise a sunless
+    spell would restart, drain, stop, and repeat.
+    """
+    d = _probe(current_a=0, probe_off_seconds=1200.0, soc_deficit_kwh=0.5)
+    assert d.current_a == 0
+
+
+def test_probe_restart_soc_gate_is_tighter_than_the_hold_budget() -> None:
+    """restart_eps = min(SOC_FULL_EPS_KWH, soc_drop_kwh / 2).
+
+    The min() is load-bearing: soc_drop_kwh is user-configurable as a
+    percentage of battery capacity, so a small percentage on a small battery
+    can land it BELOW the fixed 0.2 kWh arm epsilon. A bare SOC_FULL_EPS_KWH
+    restart gate would then be looser than the stop gate — stop at a 0.05 kWh
+    deficit, immediately cleared to restart at up to 0.2 — which is the
+    original chatter with extra steps.
+    """
+    tiny = SurplusProbeParams(soc_drop_kwh=0.05)
+    # A deficit that already ends a hold (0.06 > 0.05) must not clear restart.
+    d = _probe(current_a=0, probe_off_seconds=1200.0,
+               soc_deficit_kwh=0.06, probe=tiny)
+    assert d.current_a == 0
+    # Inside restart_eps (0.025) it may restart.
+    d = _probe(current_a=0, probe_off_seconds=1200.0,
+               soc_deficit_kwh=0.02, probe=tiny)
+    assert d.current_a == 6
 
 
 def test_probe_holds_on_first_soft_battery_discharge() -> None:

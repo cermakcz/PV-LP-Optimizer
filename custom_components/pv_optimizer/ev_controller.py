@@ -147,22 +147,47 @@ def decide_surplus_probe(
     current_a: int,
     cycles_since_up: int,
     cycles_overshooting: int,
+    probe_on_seconds: float,
+    probe_off_seconds: float,
+    import_over_seconds: float,
+    soc_deficit_kwh: float,
     ev,  # EVParams
+    probe,  # SurplusProbeParams
 ) -> SurplusProbeDecision:
-    """Zero-import regulator step (see spec §"Control law").
+    """Zero-import regulator step, split by where the current sits.
 
-    Down, two-tier. Past ``PROBE_DISCHARGE_HARD_W`` of battery discharge, or
-    *any* grid import past ``PROBE_IMPORT_CEILING_W``, step down one amp
-    immediately (below min -> 0): the loss is real and happening now. Inside
-    the soft band (``PROBE_DISCHARGE_CEILING_W`` .. hard) the drain must
-    persist ``PROBE_OVERSHOOT_SUSTAIN_CYCLES`` consecutive cycles first, so a
-    transient — a kettle, a passing cloud, the settling tick right after an
-    up-step — doesn't ratchet the current down. While counting we hold rather
-    than step up: we already suspect we're over.
+    **Above minimum current**, a down-step gives back one amp: cheap,
+    reversible, correct immediately. Past ``PROBE_DISCHARGE_HARD_W`` of battery
+    discharge, or *any* grid import past ``PROBE_IMPORT_CEILING_W``, step down
+    at once. Inside the soft band (``PROBE_DISCHARGE_CEILING_W`` .. hard) the
+    drain must persist ``PROBE_OVERSHOOT_SUSTAIN_CYCLES`` consecutive cycles
+    first, so a transient — a kettle, a passing cloud, the settling tick right
+    after an up-step — doesn't ratchet the current down.
+
+    **At minimum current** there is no down-step, so the only move is to stop:
+    expensive (it cycles the car's connector and costs throughput) and
+    governed differently. The discharge ceilings are the wrong instrument
+    here — with the battery full and PV clipped, "feeding the car from
+    curtailed PV via the battery" and "draining the battery into the car" look
+    identical, and only the SoC trend separates them. So instead:
+    ``probe.min_on_seconds`` is a floor on session length, and past it a
+    deficit beyond ``probe.soc_drop_kwh`` ends the hold. There is deliberately
+    no maximum-on cap: while the surplus covers the car the SoC stays near
+    full and charging runs uninterrupted.
+
+    **Leaving zero** needs both ``probe.restart_cooldown_seconds`` to have
+    elapsed and the battery to be genuinely full again — a floor on off-time
+    plus proof that surplus actually returned.
 
     Up (speculative): at most one amp every PROBE_UP_INTERVAL_CYCLES, only
     while not overshooting, below max, and the next amp still fits the
     forecast surplus headroom. Otherwise hold and advance the up-counter.
+
+    All dwells are seconds, computed by the caller (same idiom as
+    ``is_session_done(low_power_seconds=...)``) so this stays clock-free.
+    Cycle counting would be the wrong clock: ``charger_state_entity`` is a
+    re-plan trigger, so every start/stop write fires an extra off-cadence
+    tick, precisely around the transitions the dwells exist to damp.
     """
     min_a = int(round(ev.min_charging_current_a))
     max_a = int(round(ev.max_charging_current_a))
@@ -185,7 +210,17 @@ def decide_surplus_probe(
                                     cycles_overshooting=sustained)
 
     if current_a < min_a:
-        # Not charging yet — kick to min as the first probe.
+        # Not charging. Two gates before kicking to min.
+        if probe_off_seconds < probe.restart_cooldown_seconds:
+            return SurplusProbeDecision(current_a=0, cycles_since_up=0)
+        # Battery genuinely full again, not merely inside the hold budget.
+        # The min() keeps this strictly tighter than the stop gate for every
+        # configurable budget: soc_drop_kwh is a percentage of battery
+        # capacity and can land below the fixed arm epsilon, which would make
+        # the restart gate looser than the stop gate and re-create the chatter.
+        restart_eps = min(SOC_FULL_EPS_KWH, probe.soc_drop_kwh / 2.0)
+        if soc_deficit_kwh > restart_eps:
+            return SurplusProbeDecision(current_a=0, cycles_since_up=0)
         return SurplusProbeDecision(current_a=min_a, cycles_since_up=0)
 
     can_step_up = (
