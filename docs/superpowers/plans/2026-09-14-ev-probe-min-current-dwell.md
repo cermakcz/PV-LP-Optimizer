@@ -956,6 +956,22 @@ MSG
 - Modify: `custom_components/pv_optimizer/planner.py:50-79` (`EVRuntimeState`), `:112-144` (`EVConfig`), `:913-965` (`_run_surplus_probe`), `:905` (its call site)
 - Test: `tests/test_planner.py:2179-2320`
 
+> **Correction applied during execution.** The plan assumed the full suite would
+> stay green through Tasks 2-6. It does not: making `probe` a required argument
+> of `should_probe_surplus` in Task 2 breaks `planner.py`'s call site and turned
+> 14 `test_planner.py` tests red. Leaving that outstanding until Task 7 would
+> have left Task 4 — the highest-risk change in the plan — with no clean
+> full-suite signal, so three items were **forward-pulled into Task 2**:
+>
+> - the `SurplusProbeParams` entry in planner's `from .models import (...)` block
+>   (part of step 3a),
+> - the whole of step 3b (`EVConfig.probe` with its `default_factory`),
+> - the `probe=cfg.probe,` argument on the `should_probe_surplus(...)` call
+>   inside `_run_surplus_probe` (part of step 3f).
+>
+> When executing this task, treat those three as already done and verify rather
+> than re-apply them. Everything else below is untouched.
+
 - [ ] **Step 1: Write the failing tests**
 
 In `tests/test_planner.py`, add `probe` to `_probe_ev_cfg` (line ~2183):
@@ -1137,16 +1153,20 @@ from .models import (
 )
 ```
 
-**3b.** In `EVConfig` (line ~119), add the field immediately after `params`:
+**3b.** In `EVConfig`, add the field **after `max_current_entity`** — the last field without a default — and before `session_energy_entity`:
 
 ```python
-    # Static parameters.
-    params: EVParams
-    # Minimum-current dwell tunables for the curtailed-surplus probe.
+    max_current_entity: str     # number entity (A) — output
+    # Minimum-current dwell tunables for the curtailed-surplus probe. Placed
+    # after the no-default entity fields above (dataclass field-ordering
+    # requires defaulted fields to come after non-defaulted ones).
     probe: SurplusProbeParams = field(default_factory=SurplusProbeParams)
+    session_energy_entity: str | None = None
 ```
 
-`field` is already imported in `planner.py` (line 11: `from dataclasses import dataclass, field, replace`). A default is supplied so every existing `EVConfig(...)` construction in tests keeps working.
+It cannot go next to `params: EVParams`, which is where it logically belongs: `charger_state_entity`, `charging_power_entity` and `max_current_entity` follow `params` and have no defaults, so a defaulted `probe` placed before them fails at class-definition time with `TypeError: non-default argument 'charger_state_entity' follows default argument 'probe'`.
+
+`field` is already imported in `planner.py` (line 11: `from dataclasses import dataclass, field, replace`). A default is supplied so every existing `EVConfig(...)` construction in tests keeps working — and every construction site uses keyword arguments, so the field's position is not observable by callers.
 
 **3c.** In `EVRuntimeState` (line ~75), replace the probe-state block:
 
