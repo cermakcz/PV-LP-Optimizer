@@ -9,7 +9,6 @@ from custom_components.pv_optimizer.ev_controller import (
     DEFAULT_STATE_VOCAB,
     should_probe_surplus,
     SOC_FULL_EPS_KWH,
-    SOC_DISARM_EPS_KWH,
     decide_surplus_probe,
     PROBE_UP_INTERVAL_CYCLES,
     PROBE_OVERSHOOT_SUSTAIN_CYCLES,
@@ -442,6 +441,8 @@ def test_car_auto_return_switch_class_shape() -> None:
 # Task 3: should_probe_surplus
 # ---------------------------------------------------------------------------
 
+from custom_components.pv_optimizer.models import SurplusProbeParams
+
 
 def _arm_kwargs(**over):
     base = dict(
@@ -454,6 +455,7 @@ def _arm_kwargs(**over):
         forecast_surplus_kw=2.0,
         battery_power_available=True,
         grid_available=True,
+        probe=SurplusProbeParams(),
     )
     base.update(over)
     return base
@@ -494,9 +496,24 @@ def test_should_probe_blocks_without_forecast_surplus() -> None:
 
 
 def test_should_probe_disarm_uses_wider_soc_margin() -> None:
-    # soc 8.6: below arm floor (8.8) but above disarm floor (9.0-0.5=8.5).
+    # Default probe: soc_drop 1.0 => disarm margin 1.5. soc 8.6 is a 0.4 kWh
+    # deficit: below the arm floor (0.2) but well inside the disarm margin.
     assert should_probe_surplus(**_arm_kwargs(soc_kwh=8.6, currently_armed=False)) is False
     assert should_probe_surplus(**_arm_kwargs(soc_kwh=8.6, currently_armed=True)) is True
+
+
+def test_should_probe_disarm_margin_tracks_the_hold_budget() -> None:
+    """The disarm margin is derived from soc_drop_kwh, so a wider hold budget
+    automatically widens the margin that keeps the probe armed. Without this
+    the hold would trip the disarm before the budget and chatter via
+    disarm/re-arm.
+    """
+    wide = SurplusProbeParams(soc_drop_kwh=2.0)   # disarm margin 2.5
+    # soc 7.0 = a 2.0 kWh deficit: outside the default 1.5 margin, inside 2.5.
+    assert should_probe_surplus(
+        **_arm_kwargs(soc_kwh=7.0, currently_armed=True)) is False
+    assert should_probe_surplus(
+        **_arm_kwargs(soc_kwh=7.0, currently_armed=True, probe=wide)) is True
 
 
 # ---------------------------------------------------------------------------
@@ -604,8 +621,6 @@ def test_probe_does_not_exceed_max() -> None:
 # SurplusProbeParams
 # ---------------------------------------------------------------------------
 
-from custom_components.pv_optimizer.models import SurplusProbeParams
-
 
 def test_probe_params_defaults() -> None:
     p = SurplusProbeParams()
@@ -629,9 +644,11 @@ def test_probe_params_disarm_eps_is_derived_above_the_budget() -> None:
     {"min_on_seconds": 0.0},
     {"min_on_seconds": -1.0},
     {"restart_cooldown_seconds": 0.0},
+    {"restart_cooldown_seconds": -1.0},
     {"soc_drop_kwh": 0.0},
     {"soc_drop_kwh": -0.5},
     {"import_hard_w": 0.0},
+    {"import_hard_w": -100.0},
 ])
 def test_probe_params_rejects_non_positive(kwargs) -> None:
     with pytest.raises(ValueError):

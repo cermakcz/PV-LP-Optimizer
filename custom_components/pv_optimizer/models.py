@@ -255,6 +255,9 @@ class SurplusProbeParams:
         Derived rather than configurable: it MUST stay wider than
         ``soc_drop_kwh``, or the arm/disarm boundary trips before the hold
         budget does and the probe chatters via disarm/re-arm instead.
+
+        See ``docs/superpowers/specs/2026-09-14-ev-probe-min-current-dwell-design.md``
+        ("Restart gating") for the full threshold-ordering derivation.
         """
         return self.soc_drop_kwh + 0.5
 

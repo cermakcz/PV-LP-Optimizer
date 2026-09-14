@@ -76,16 +76,21 @@ def classify_state(
     return EVStateClass.CONNECTED_IDLE  # conservative fallback
 
 
-# --- Curtailed-surplus probe (see specs/2026-06-23-ev-curtailed-surplus-probe) ---
-# All tunable; initial values to validate empirically.
+# --- Curtailed-surplus probe (see specs/2026-06-23-ev-curtailed-surplus-probe
+# and specs/2026-09-14-ev-probe-min-current-dwell) ---
+# All tunable; initial values to validate empirically. The minimum-current
+# dwell knobs live on models.SurplusProbeParams (user-configurable); the
+# constants here govern one-amp steps above minimum current.
 SOC_FULL_EPS_KWH = 0.2        # how close to soc_max counts as "full" (arm)
-SOC_DISARM_EPS_KWH = 0.5      # wider margin to stay armed (avoid self-disarm)
 PROBE_FORECAST_MARGIN_KW = 0.5  # forecast surplus must exceed this to arm
 PROBE_DISCHARGE_CEILING_W = 300.0  # soft band floor: sustained drain steps down
 PROBE_DISCHARGE_HARD_W = 1500.0    # hard ceiling: step down immediately
 PROBE_IMPORT_CEILING_W = 500.0     # step down above this grid import
 PROBE_UP_INTERVAL_CYCLES = 1       # min cycles between speculative up-steps
 PROBE_OVERSHOOT_SUSTAIN_CYCLES = 2  # soft-band cycles before stepping down
+# Soft import tier's dwell at minimum current, where the only move is to stop.
+# Above minimum current the soft tier still steps down immediately.
+PROBE_IMPORT_SUSTAIN_SECONDS = 600.0
 
 
 def should_probe_surplus(
@@ -99,6 +104,7 @@ def should_probe_surplus(
     forecast_surplus_kw: float,
     battery_power_available: bool,
     grid_available: bool,
+    probe,  # SurplusProbeParams
     eps: float = 1e-6,
 ) -> bool:
     """True iff the planner should take over surplus charging from the EVCS.
@@ -106,8 +112,9 @@ def should_probe_surplus(
     Arms only in the curtailment corner: battery full, no LP-planned EV charge,
     not exporting (so the EVCS's export-follower would be blind), forecast says
     surplus exists, car connected, and both signal sources are available.
-    Uses a wider SoC margin while already armed so the probe's own brief
-    overshoot-dip can't disarm it.
+    Uses ``probe.soc_disarm_eps_kwh`` (derived, wider than the hold budget)
+    while already armed, so neither the probe's own overshoot-dip nor a
+    deliberate minimum-current hold can disarm it.
     """
     if not (battery_power_available and grid_available):
         return False
@@ -115,7 +122,7 @@ def should_probe_surplus(
         return False
     if p_ev_chg_kw > eps or p_sell_kw > eps:
         return False
-    soc_eps = SOC_DISARM_EPS_KWH if currently_armed else SOC_FULL_EPS_KWH
+    soc_eps = probe.soc_disarm_eps_kwh if currently_armed else SOC_FULL_EPS_KWH
     if soc_kwh < soc_max_kwh - soc_eps:
         return False
     if forecast_surplus_kw <= PROBE_FORECAST_MARGIN_KW:

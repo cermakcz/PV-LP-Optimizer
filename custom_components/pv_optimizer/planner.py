@@ -33,6 +33,7 @@ from .models import (
     OptimizerInputs,
     OptimizerResult,
     SlotPlan,
+    SurplusProbeParams,
     TariffSlot,
 )
 from .optimizer import solve
@@ -122,6 +123,10 @@ class EVConfig:
     charger_state_entity: str
     charging_power_entity: str  # W by default; only treated as kW when unit_of_measurement == "kW"
     max_current_entity: str     # number entity (A) — output
+    # Minimum-current dwell tunables for the curtailed-surplus probe. Placed
+    # after the no-default entity fields above (dataclass field-ordering
+    # requires defaulted fields to come after non-defaulted ones).
+    probe: SurplusProbeParams = field(default_factory=SurplusProbeParams)
     session_energy_entity: str | None = None
     start_switch_entity: str | None = None
     charger_mode_entity: str | None = None
@@ -936,6 +941,7 @@ class Planner:
             forecast_surplus_kw=forecast_surplus,
             battery_power_available=batt is not None and soc_pct is not None,
             grid_available=grid is not None,
+            probe=cfg.probe,
         )
         if not armed:
             if es.probe_armed:
