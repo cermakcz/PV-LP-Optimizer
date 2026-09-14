@@ -1423,6 +1423,57 @@ These three files are HA-only and not unit-tested in this repo by design (see th
 > chatter test's `min(on_runs) >= probe.min_on_seconds` assertion still holds
 > (runs are 55 min), and its 1800 s bar is unaffected.
 
+> **Two items carried from Task 6's code review.**
+>
+> **1. Extract the worst-case arithmetic before writing a second copy of it.**
+> The warning below needs the worst-case kWh and the budget to be useful, so it
+> would otherwise recompute the formula that already lives inside
+> `probe_floor_outspends_budget`, leaving it in two places with nothing keeping
+> them in sync. Instead add a tiny pure helper in `ev_controller.py` and have
+> both callers use it:
+>
+> ```python
+> def probe_floor_worst_case_kwh(*, ev, probe) -> float:
+>     """Battery energy the min-on floor can spend in the worst case.
+>
+>     Worst case is the whole minimum-current draw coming from the battery for
+>     the entire floor. Grid import cannot beat it: import only occurs when the
+>     battery cannot cover the draw, which spends *less* battery, and a large
+>     enough import trips the escape that ends the hold early.
+>     """
+>     return (probe.min_on_seconds
+>             * ev.min_charging_current_a
+>             * ev.kw_per_amp) / 3600.0
+> ```
+>
+> Then `probe_floor_outspends_budget` becomes
+> `return probe_floor_worst_case_kwh(ev=ev, probe=probe) > probe.soc_drop_kwh`,
+> and `__init__.py`'s warning calls the helper for the number it reports. Add a
+> test asserting the helper's value for `_EV_3P` at the default floor
+> (300 s x 6 A x 0.6875 kW/A / 3600 = 0.34375 kWh) and for `_PROBE_EV`
+> (300 x 6 x 0.225 / 3600 = 0.1125 kWh).
+>
+> The docstring note about why import is never worse is worth keeping: a
+> maintainer will otherwise reasonably wonder whether grid import makes the
+> worst case larger.
+>
+> **2. Pin the equality boundary.** `probe_floor_outspends_budget` uses a strict
+> `>`, and this file pins exactly this class of boundary elsewhere
+> (`test_probe_restart_cooldown_boundary_is_exclusive`,
+> `test_probe_restart_soc_boundary_is_exclusive`) because `>` / `>=` slips are
+> easy to introduce silently. Add:
+>
+> ```python
+> def test_floor_exactly_equal_to_budget_is_not_outspending() -> None:
+>     """Strict ``>``: a floor whose worst case exactly equals the budget still
+>     leaves the budget able to decide, so it is not a misconfiguration.
+>     """
+>     exact = probe_floor_worst_case_kwh(
+>         ev=_EV_3P, probe=SurplusProbeParams())
+>     assert probe_floor_outspends_budget(
+>         ev=_EV_3P, probe=SurplusProbeParams(soc_drop_kwh=exact)) is False
+> ```
+
 - [ ] **Step 1: Add the config keys**
 
 In `const.py`, add to the EV configuration-keys block, after `CONF_EV_SESSION_DONE_SECONDS`:
