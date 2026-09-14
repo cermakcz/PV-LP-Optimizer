@@ -217,7 +217,10 @@ def decide_surplus_probe(
             if import_over_seconds >= PROBE_IMPORT_SUSTAIN_SECONDS:
                 return _stop()
             # Sustain not met: fall through to the drain handling below, which
-            # holds at min. Never step up while importing.
+            # decides on its own terms. Usually that means holding at min, but
+            # a simultaneously-exhausted SoC budget still stops — correctly, a
+            # spent budget ends the hold whatever else is true. Either way we
+            # never step up while importing.
 
     if current_a < min_a:
         # Not charging. Two gates before kicking to min.
@@ -231,6 +234,8 @@ def decide_surplus_probe(
         restart_eps = min(SOC_FULL_EPS_KWH, probe.soc_drop_kwh / 2.0)
         if soc_deficit_kwh > restart_eps:
             return _stop()
+        # Kicking to min from stopped. Same value as _hold_at_min(), kept
+        # separate because this is a start, not a continuation.
         return SurplusProbeDecision(current_a=min_a, cycles_since_up=0)
 
     over_soft = battery_discharge_w > PROBE_DISCHARGE_CEILING_W

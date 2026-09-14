@@ -681,15 +681,17 @@ def test_probe_holds_at_min_through_hard_drain_inside_the_floor() -> None:
     assert d.current_a == 6
 
 
-def test_probe_holds_at_min_indefinitely_while_soc_stays_full() -> None:
-    """No maximum-on cap. With the battery full and PV clipped, discharging to
-    feed the car opens headroom the curtailed PV immediately refills, so the
-    deficit stays near zero and charging should never be interrupted.
+def test_probe_holds_at_min_past_the_floor_while_soc_stays_full() -> None:
+    """No maximum-on cap: past the floor, a near-full battery keeps charging
+    however long it has been on.
+
+    Note the absence of a cap is structural — there is no elapsed-time check
+    after the floor — so one call past the floor is all a stateless function
+    can demonstrate. A very large ``probe_on_seconds`` documents the intent.
     """
-    for on_seconds in (700.0, 3600.0, 86400.0):
-        d = _probe(current_a=6, battery_discharge_w=2000.0,
-                   probe_on_seconds=on_seconds, soc_deficit_kwh=0.1)
-        assert d.current_a == 6
+    d = _probe(current_a=6, battery_discharge_w=2000.0,
+               probe_on_seconds=86400.0, soc_deficit_kwh=0.1)
+    assert d.current_a == 6
 
 
 def test_probe_stops_at_min_once_the_soc_budget_is_spent() -> None:
@@ -704,6 +706,59 @@ def test_probe_soc_budget_does_not_override_the_min_on_floor() -> None:
     d = _probe(current_a=6, battery_discharge_w=2000.0,
                probe_on_seconds=300.0, soc_deficit_kwh=1.2)
     assert d.current_a == 6
+
+
+def test_probe_hard_import_stops_at_min_overriding_the_floor() -> None:
+    """Import is real money, so it is allowed to break the connector-
+    protection floor. The restart cooldown bounds the resulting cycling.
+    """
+    d = _probe(current_a=6, grid_import_w=2500.0, probe_on_seconds=10.0)
+    assert d.current_a == 0
+
+
+def test_probe_hard_import_steps_down_above_min() -> None:
+    d = _probe(current_a=10, grid_import_w=2500.0)
+    assert d.current_a == 9
+
+
+def test_probe_soft_import_at_min_needs_sustain() -> None:
+    """500 W for one cycle is ~0.04 kWh -- about a cent. Stopping instantly
+    over that would let one kettle end a charging session.
+    """
+    d = _probe(current_a=6, grid_import_w=800.0, probe_on_seconds=1200.0,
+               import_over_seconds=60.0)
+    assert d.current_a == 6
+
+
+def test_probe_soft_import_at_min_stops_once_sustained() -> None:
+    d = _probe(current_a=6, grid_import_w=800.0, probe_on_seconds=1200.0,
+               import_over_seconds=601.0)
+    assert d.current_a == 0
+
+
+def test_probe_soft_import_at_min_never_steps_up() -> None:
+    """While importing we already suspect we are over: hold, don't probe up.
+    """
+    d = _probe(current_a=6, grid_import_w=800.0, probe_on_seconds=1200.0,
+               import_over_seconds=60.0, forecast_surplus_kw=10.0)
+    assert d.current_a == 6
+
+
+def test_probe_import_escape_inactive_at_zero() -> None:
+    """Nothing to escape from when already stopped; the restart gates own
+    this state. Import here is the house, not the car.
+    """
+    d = _probe(current_a=0, grid_import_w=2500.0, probe_off_seconds=1200.0)
+    assert d.current_a == 6
+
+
+def test_probe_soft_import_at_min_still_stops_on_spent_budget() -> None:
+    """The soft-import fall-through does not force a hold. An exhausted SoC
+    budget stops charging regardless of why we fell through.
+    """
+    d = _probe(current_a=6, grid_import_w=800.0, import_over_seconds=60.0,
+               probe_on_seconds=1200.0, soc_deficit_kwh=1.2)
+    assert d.current_a == 0
 
 
 def test_probe_at_min_emits_zero_overshoot_count() -> None:
@@ -735,6 +790,98 @@ def test_probe_up_gated_by_forecast_headroom() -> None:
                forecast_surplus_kw=2.0)
     assert d.current_a == 10
     assert d.cycles_since_up == PROBE_UP_INTERVAL_CYCLES
+
+
+def test_probe_does_not_chatter_across_ticks() -> None:
+    """REGRESSION, composition-level: the reported bug was 0 -> min -> 0 -> min
+    on consecutive ticks.
+
+    Drives the real decision function over a tick sequence with three-phase
+    quantization (22 kW / 32 A => 6 A is ~4.1 kW, larger than the 3 kW of
+    curtailed surplus available), which is what made the old drain test
+    permanently unsatisfiable at min current. Pins the run-length guarantees
+    -- the min-on floor, the restart cooldown, and charging runs far longer
+    than the reported ~15 minutes -- rather than a transition count: at these
+    parameters the probe settles into a stable limit cycle of roughly 45-50
+    min charging against 15 min off, which is expected (the SoC budget binds
+    on a fixed schedule here), not chatter.
+    """
+    ev_3p = EVParams(
+        max_charging_power_kw=22.0, max_charging_current_a=32.0,
+        min_charging_current_a=6.0, car_battery_kwh=60.0,
+    )
+    probe = SurplusProbeParams(soc_drop_kwh=0.9)
+    cycle_s, surplus_kw = 300.0, 3.0
+
+    current, on_s, off_s, deficit = 6, 0.0, float("inf"), 0.0
+    cycles_since_up = cycles_overshooting = 0
+    # Track alternating runs of charging / not-charging, in ticks.
+    runs: list[tuple[bool, int]] = []
+
+    for _ in range(48):  # 4 hours at a 300 s cadence
+        draw_kw = current * ev_3p.kw_per_amp
+        drain_kw = max(0.0, draw_kw - surplus_kw)
+        d = decide_surplus_probe(
+            battery_discharge_w=drain_kw * 1000.0,
+            grid_import_w=0.0,
+            forecast_surplus_kw=surplus_kw,
+            current_a=current,
+            cycles_since_up=cycles_since_up,
+            cycles_overshooting=cycles_overshooting,
+            probe_on_seconds=on_s,
+            probe_off_seconds=off_s,
+            import_over_seconds=0.0,
+            soc_deficit_kwh=deficit,
+            ev=ev_3p,
+            probe=probe,
+        )
+        previous = current
+        current = d.current_a
+        cycles_since_up = d.cycles_since_up
+        cycles_overshooting = d.cycles_overshooting
+
+        is_charging = current > 0
+        if runs and runs[-1][0] == is_charging:
+            charging, n = runs[-1]
+            runs[-1] = (charging, n + 1)
+        else:
+            runs.append((is_charging, 1))
+        if current > 0:
+            on_s = 0.0 if previous == 0 else on_s + cycle_s
+            off_s = float("inf") if previous == 0 else off_s
+        else:
+            off_s = 0.0 if previous > 0 else off_s + cycle_s
+            on_s = 0.0
+        # Deficit accrues from real drain while charging, and the curtailed
+        # surplus refills it once the car stops taking it.
+        rate_kw = drain_kw if current > 0 else -surplus_kw
+        deficit = max(0.0, deficit + rate_kw * cycle_s / 3600.0)
+
+    # Only complete runs can be checked; the first and last are truncated by
+    # the window, so drop them.
+    complete = runs[1:-1]
+    on_runs = [n * cycle_s for charging, n in complete if charging]
+    off_runs = [n * cycle_s for charging, n in complete if not charging]
+
+    assert on_runs and off_runs, f"expected alternating runs, got {runs}"
+
+    # The connector-protection guarantee: no charging run is shorter than the
+    # min-on floor.
+    assert min(on_runs) >= probe.min_on_seconds, (
+        f"charging run shorter than the min-on floor: {on_runs}")
+
+    # The off-side guarantee: no pause is shorter than the restart cooldown.
+    assert min(off_runs) >= probe.restart_cooldown_seconds, (
+        f"pause shorter than the restart cooldown: {off_runs}")
+
+    # The actual regression. The reported bug charged ~15 min and then cut out
+    # for a cycle, indefinitely. Every charging run must now be substantially
+    # longer than that, which is what makes the SoC budget rather than the
+    # instantaneous drain the thing that ends a session.
+    assert min(on_runs) >= 1800.0, (
+        f"charging runs are still short — the drain test may be deciding "
+        f"again rather than the SoC budget: "
+        f"{[s / 60 for s in on_runs]} minutes")
 
 
 def test_probe_does_not_exceed_max() -> None:
