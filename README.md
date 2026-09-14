@@ -468,12 +468,13 @@ repeating — one connector cycle every ~80 minutes instead of one every ~15.
 If the sun genuinely disappears, you get one bounded drain event and then
 nothing until the battery refills. And once the surplus covers the car
 outright (≥ 4.1 kW on three phases), the probe never even reaches minimum —
-it steps up past it, so none of this applies. Be clear about what that is and
-isn't: cycling is reduced and bounded, not eliminated. Below the
-minimum-current quantum some cycling is unavoidable — the charger's minimum
-is a large step, and closing that gap fully would mean duty-cycling the
-current below the minimum itself, which is a bigger change this design
-deliberately leaves alone.
+it steps up past it, so none of this applies.
+
+What this is not, though, is an end to cycling — it's cycling made rarer and
+its cost bounded. Below the minimum-current quantum some of it is unavoidable:
+the charger's minimum is a large step, and closing that gap completely would
+mean duty-cycling the current below the minimum itself, which is a bigger
+change this design deliberately leaves alone.
 
 This needs the optional **battery power** entity (signed, negative =
 discharging) wired up in the Entities step. Without it the probe stays off
