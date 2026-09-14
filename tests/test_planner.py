@@ -2444,7 +2444,7 @@ def test_probe_sequential_ticks_compose_a_run_a_cooldown_and_a_restart() -> None
     partway through -- the whole run fits in 25 minutes.
     """
     from custom_components.pv_optimizer.models import SurplusProbeParams
-    default_probe = SurplusProbeParams()  # min_on_seconds=600, restart_cooldown_seconds=600
+    default_probe = SurplusProbeParams()  # min_on_seconds=300, restart_cooldown_seconds=600
 
     states = _probe_states()
     p = Planner(_config(ev=_probe_ev_cfg(), battery_power_entity="sensor.batt_w"),

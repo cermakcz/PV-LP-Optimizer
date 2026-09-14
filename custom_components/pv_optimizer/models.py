@@ -233,7 +233,7 @@ class SurplusProbeParams:
       ``min_on_seconds``. Import is real money.
     """
 
-    min_on_seconds: float = 600.0
+    min_on_seconds: float = 300.0
     restart_cooldown_seconds: float = 600.0
     soc_drop_kwh: float = 1.0
     import_hard_w: float = 2000.0

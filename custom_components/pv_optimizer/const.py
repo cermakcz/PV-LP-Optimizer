@@ -120,11 +120,33 @@ CONF_EV_CURRENT_TOLERANCE_A = "ev_current_tolerance_a"
 CONF_EV_SESSION_DONE_POWER_W = "ev_session_done_power_w"
 CONF_EV_SESSION_DONE_SECONDS = "ev_session_done_seconds"
 
+# Curtailed-surplus probe: minimum-current dwell. At min charging current the
+# probe has no down-step available, so the only move is to stop -- expensive
+# (it cycles the car's connector and costs throughput). These govern it in
+# place of the instantaneous discharge ceilings, which cannot tell "surplus
+# arriving via a full battery" from "the battery draining into the car".
+CONF_EV_PROBE_MIN_ON_SECONDS = "ev_probe_min_on_seconds"
+CONF_EV_PROBE_RESTART_COOLDOWN_SECONDS = "ev_probe_restart_cooldown_seconds"
+CONF_EV_PROBE_SOC_DROP_PCT = "ev_probe_soc_drop_pct"
+CONF_EV_PROBE_IMPORT_HARD_W = "ev_probe_import_hard_w"
+
 DEFAULT_EV_MIN_CHARGING_CURRENT_A = 6.0
 DEFAULT_EV_BUY_PRICE_THRESHOLD = 0.0
 DEFAULT_EV_CURRENT_TOLERANCE_A = 1.0
 DEFAULT_EV_SESSION_DONE_POWER_W = 100.0
 DEFAULT_EV_SESSION_DONE_SECONDS = 60.0
+
+# 300 s rather than 600: at 600 the three-phase worst-case floor spend is
+# 0.69 kWh, which exceeds a 6 % budget on any battery below ~11.5 kWh and would
+# make the budget dead code (and fire the setup warning) on stock defaults.
+DEFAULT_EV_PROBE_MIN_ON_SECONDS = 300.0
+DEFAULT_EV_PROBE_RESTART_COOLDOWN_SECONDS = 600.0
+# Percent of battery capacity, converted to kWh in __init__.py -- matches the
+# other SoC fields on the form. 6 % of a 10-20 kWh battery is ~0.6-1.2 kWh,
+# putting the stop threshold around 94 % of soc_max and the restart at ~98 %.
+# Both are offsets below the configured soc_max, not absolute SoC.
+DEFAULT_EV_PROBE_SOC_DROP_PCT = 6.0
+DEFAULT_EV_PROBE_IMPORT_HARD_W = 2000.0
 # EVCS HACS uses "Manual"/"Auto"; users with other chargers override
 # these in the config flow.
 DEFAULT_EV_CHARGER_MODE_OPTION_ACTIVE = "Manual"

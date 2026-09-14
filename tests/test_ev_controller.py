@@ -712,7 +712,7 @@ def test_probe_soc_budget_does_not_override_the_min_on_floor() -> None:
     """Ordering: the floor is checked first. Only the import escapes break it.
     """
     d = _probe(current_a=6, battery_discharge_w=2000.0,
-               probe_on_seconds=300.0, soc_deficit_kwh=1.2)
+               probe_on_seconds=200.0, soc_deficit_kwh=1.2)
     assert d.current_a == 6
 
 
@@ -925,7 +925,7 @@ def test_probe_does_not_exceed_max() -> None:
 
 def test_probe_params_defaults() -> None:
     p = SurplusProbeParams()
-    assert p.min_on_seconds == 600.0
+    assert p.min_on_seconds == 300.0
     assert p.restart_cooldown_seconds == 600.0
     assert p.soc_drop_kwh == 1.0
     assert p.import_hard_w == 2000.0
@@ -962,6 +962,7 @@ def test_probe_params_rejects_non_positive(kwargs) -> None:
 
 from custom_components.pv_optimizer.ev_controller import (
     probe_floor_outspends_budget,
+    probe_floor_worst_case_kwh,
 )
 
 # _EV_3P is defined above, near _PROBE_EV: 22 kW / 32 A => 0.6875 kW/A, so
@@ -969,10 +970,10 @@ from custom_components.pv_optimizer.ev_controller import (
 
 
 def test_floor_outspends_budget_when_budget_is_small() -> None:
-    # 10 min at 4.125 kW = 0.69 kWh, which a 0.5 kWh budget cannot cover:
+    # 300 s at 4.125 kW = 0.34375 kWh, which a 0.2 kWh budget cannot cover:
     # the floor would decide every stop and the budget nothing.
     assert probe_floor_outspends_budget(
-        ev=_EV_3P, probe=SurplusProbeParams(soc_drop_kwh=0.5)) is True
+        ev=_EV_3P, probe=SurplusProbeParams(soc_drop_kwh=0.2)) is True
 
 
 def test_floor_within_budget_at_defaults_three_phase() -> None:
@@ -981,7 +982,7 @@ def test_floor_within_budget_at_defaults_three_phase() -> None:
 
 
 def test_floor_within_budget_single_phase() -> None:
-    # 7.2 kW / 32 A => 6 A is ~1.35 kW; 10 min is only 0.22 kWh.
+    # 7.2 kW / 32 A => 6 A is ~1.35 kW; 300 s is only 0.1125 kWh.
     assert probe_floor_outspends_budget(
         ev=_PROBE_EV, probe=SurplusProbeParams(soc_drop_kwh=0.5)) is False
 
@@ -990,3 +991,24 @@ def test_floor_outspends_budget_scales_with_the_floor() -> None:
     assert probe_floor_outspends_budget(
         ev=_EV_3P, probe=SurplusProbeParams(
             min_on_seconds=1800.0, soc_drop_kwh=1.0)) is True
+
+
+def test_floor_worst_case_kwh_three_phase() -> None:
+    # 300 s x 6 A x 0.6875 kW/A / 3600 = 0.34375 kWh.
+    assert probe_floor_worst_case_kwh(
+        ev=_EV_3P, probe=SurplusProbeParams()) == pytest.approx(0.34375)
+
+
+def test_floor_worst_case_kwh_single_phase() -> None:
+    # 300 s x 6 A x 0.225 kW/A / 3600 = 0.1125 kWh.
+    assert probe_floor_worst_case_kwh(
+        ev=_PROBE_EV, probe=SurplusProbeParams()) == pytest.approx(0.1125)
+
+
+def test_floor_exactly_equal_to_budget_is_not_outspending() -> None:
+    """Strict ``>``: a floor whose worst case exactly equals the budget still
+    leaves the budget able to decide, so it is not a misconfiguration.
+    """
+    exact = probe_floor_worst_case_kwh(ev=_EV_3P, probe=SurplusProbeParams())
+    assert probe_floor_outspends_budget(
+        ev=_EV_3P, probe=SurplusProbeParams(soc_drop_kwh=exact)) is False

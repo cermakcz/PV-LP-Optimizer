@@ -169,6 +169,14 @@ _EV_SCHEMA = vol.Schema({
                  default=C.DEFAULT_EV_SESSION_DONE_POWER_W): _num(0.0, 1000.0, 10.0, "W"),
     vol.Optional(C.CONF_EV_SESSION_DONE_SECONDS,
                  default=C.DEFAULT_EV_SESSION_DONE_SECONDS): _num(0.0, 600.0, 5.0, "s"),
+    vol.Optional(C.CONF_EV_PROBE_MIN_ON_SECONDS,
+                 default=C.DEFAULT_EV_PROBE_MIN_ON_SECONDS): _num(30.0, 3600.0, 30.0, "s"),
+    vol.Optional(C.CONF_EV_PROBE_RESTART_COOLDOWN_SECONDS,
+                 default=C.DEFAULT_EV_PROBE_RESTART_COOLDOWN_SECONDS): _num(30.0, 3600.0, 30.0, "s"),
+    vol.Optional(C.CONF_EV_PROBE_SOC_DROP_PCT,
+                 default=C.DEFAULT_EV_PROBE_SOC_DROP_PCT): _num(0.5, 50.0, 0.5, "%"),
+    vol.Optional(C.CONF_EV_PROBE_IMPORT_HARD_W,
+                 default=C.DEFAULT_EV_PROBE_IMPORT_HARD_W): _num(100.0, 20000.0, 100.0, "W"),
 })
 
 

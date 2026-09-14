@@ -273,6 +273,19 @@ def decide_surplus_probe(
                                 cycles_since_up=cycles_since_up + 1)
 
 
+def probe_floor_worst_case_kwh(*, ev, probe) -> float:
+    """Battery energy the min-on floor can spend in the worst case.
+
+    Worst case is the whole minimum-current draw coming from the battery for
+    the entire floor. Grid import cannot beat it: import only occurs when the
+    battery cannot cover the draw, which spends *less* battery, and a large
+    enough import trips the escape that ends the hold early.
+    """
+    return (probe.min_on_seconds
+            * ev.min_charging_current_a
+            * ev.kw_per_amp) / 3600.0
+
+
 def probe_floor_outspends_budget(*, ev, probe) -> bool:
     """True when the min-on floor can spend more than the whole SoC budget.
 
@@ -287,10 +300,7 @@ def probe_floor_outspends_budget(*, ev, probe) -> bool:
     dominates. Refusing to start over a tuning choice would be
     disproportionate, and silently clamping would hide it.
     """
-    worst_case_kwh = (probe.min_on_seconds
-                      * ev.min_charging_current_a
-                      * ev.kw_per_amp) / 3600.0
-    return worst_case_kwh > probe.soc_drop_kwh
+    return probe_floor_worst_case_kwh(ev=ev, probe=probe) > probe.soc_drop_kwh
 
 
 @dataclass(frozen=True)

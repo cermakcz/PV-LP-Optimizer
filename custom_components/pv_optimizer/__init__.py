@@ -10,6 +10,10 @@ from __future__ import annotations
 
 from .const import DOMAIN, PLATFORMS
 
+import logging
+
+_LOGGER = logging.getLogger(__name__)
+
 __all__ = ["DOMAIN", "PLATFORMS", "async_setup_entry", "async_unload_entry"]
 
 
@@ -19,7 +23,11 @@ async def async_setup_entry(hass, entry):  # type: ignore[no-untyped-def]
     from homeassistant.core import callback
     from homeassistant.helpers.event import async_track_state_change_event
     from .coordinator import LoadForecasterOptions, PvOptimizerCoordinator
-    from .models import BatteryParams, EVParams
+    from .models import BatteryParams, EVParams, SurplusProbeParams
+    from .ev_controller import (
+        probe_floor_outspends_budget,
+        probe_floor_worst_case_kwh,
+    )
     from .planner import EVConfig, PlannerConfig, ev_replan_trigger_entities
     from . import const as C
 
@@ -75,8 +83,37 @@ async def async_setup_entry(hass, entry):  # type: ignore[no-untyped-def]
                 C.CONF_EV_BUY_PRICE_THRESHOLD,
                 C.DEFAULT_EV_BUY_PRICE_THRESHOLD)),
         )
+        ev_probe = SurplusProbeParams(
+            min_on_seconds=float(data.get(
+                C.CONF_EV_PROBE_MIN_ON_SECONDS,
+                C.DEFAULT_EV_PROBE_MIN_ON_SECONDS)),
+            restart_cooldown_seconds=float(data.get(
+                C.CONF_EV_PROBE_RESTART_COOLDOWN_SECONDS,
+                C.DEFAULT_EV_PROBE_RESTART_COOLDOWN_SECONDS)),
+            # Percent of capacity -> kWh, matching the other SoC fields.
+            soc_drop_kwh=capacity * float(data.get(
+                C.CONF_EV_PROBE_SOC_DROP_PCT,
+                C.DEFAULT_EV_PROBE_SOC_DROP_PCT)) / 100.0,
+            import_hard_w=float(data.get(
+                C.CONF_EV_PROBE_IMPORT_HARD_W,
+                C.DEFAULT_EV_PROBE_IMPORT_HARD_W)),
+        )
+        if probe_floor_outspends_budget(ev=ev_params, probe=ev_probe):
+            _LOGGER.warning(
+                "EV surplus probe: the minimum-on floor (%.0f s at %.1f A) can "
+                "drain up to %.2f kWh of the home battery, more than the "
+                "%.2f kWh SoC budget, so the budget will never be what ends a "
+                "charging hold. Lower %s or raise %s.",
+                ev_probe.min_on_seconds,
+                ev_params.min_charging_current_a,
+                probe_floor_worst_case_kwh(ev=ev_params, probe=ev_probe),
+                ev_probe.soc_drop_kwh,
+                C.CONF_EV_PROBE_MIN_ON_SECONDS,
+                C.CONF_EV_PROBE_SOC_DROP_PCT,
+            )
         ev_cfg = EVConfig(
             params=ev_params,
+            probe=ev_probe,
             charger_state_entity=ev_state_entity,
             charging_power_entity=ev_power_entity,
             max_current_entity=ev_current_entity,
