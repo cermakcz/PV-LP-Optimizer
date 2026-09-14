@@ -1557,6 +1557,32 @@ grep -n "session_done_seconds\|current_tolerance_a" README.md PRD.md
 
 The second grep finds the EV config-field tables — the new fields belong in the same tables.
 
+> **Correction applied during execution — do not oversell the hold.** A
+> controller-side simulation of the real `decide_surplus_probe` against the
+> reported scenario (three-phase, 22 kW/32 A so 6 A = 4.1 kW, 15 kWh battery,
+> 6% budget = 0.9 kWh, 300 s cycle) gives:
+>
+> | Surplus | Behaviour | Connector cycles |
+> |---|---|---|
+> | 3 kW (reported case) | ~50 min on, ~20 min off, repeating | 1 per ~70 min |
+> | 0 kW (sun gone) | one bounded drain event, then stays off | 1, then none |
+> | ≥ 4.1 kW | no drain at all — probe steps *up*, never sits at min | none |
+>
+> The spec's claim that a full battery's discharge is "immediately refilled" by
+> curtailed PV holds only while surplus **exceeds** the EV draw. At 6 A drawing
+> 4.1 kW against 3 kW of surplus the battery drains net at ~1.1 kW, the deficit
+> accrues, and the budget correctly binds after ~48 min. Charging *is*
+> uninterrupted for hours when surplus covers the draw — but in that regime the
+> probe is above minimum current anyway.
+>
+> **So when surplus sits below the minimum-current quantum, cycling is
+> unavoidable** — it is inherent to 6 A being a 4.1 kW step on three-phase. This
+> change makes each cycle roughly 3.5x longer and bounds its battery cost; it
+> does not eliminate cycling. Say that plainly in both README and PRD. Do not
+> write "charges continuously for hours" without the "while surplus covers the
+> car" qualifier. The honest headline is: fewer, longer sessions with a bounded
+> worst case, not zero interruptions.
+
 - [ ] **Step 2: Update `README.md`**
 
 In the surplus-probe subsection, replace the description of the down-step / below-min behaviour with the new law. Add this paragraph:
