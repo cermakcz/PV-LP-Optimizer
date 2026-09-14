@@ -708,6 +708,8 @@ def test_probe_soc_budget_does_not_override_the_min_on_floor() -> None:
     assert d.current_a == 6
 
 
+# -- import escapes (minimum current) --
+
 def test_probe_hard_import_stops_at_min_overriding_the_floor() -> None:
     """Import is real money, so it is allowed to break the connector-
     protection floor. The restart cooldown bounds the resulting cycling.
@@ -733,6 +735,18 @@ def test_probe_soft_import_at_min_needs_sustain() -> None:
 def test_probe_soft_import_at_min_stops_once_sustained() -> None:
     d = _probe(current_a=6, grid_import_w=800.0, probe_on_seconds=1200.0,
                import_over_seconds=601.0)
+    assert d.current_a == 0
+
+
+def test_probe_soft_import_at_min_sustained_overrides_the_floor() -> None:
+    """Sustained soft import stops charging even inside the min-on floor,
+    just as hard import does. Pinned separately because
+    ``test_probe_soft_import_at_min_stops_once_sustained`` passes a
+    probe_on_seconds already past the floor and so cannot tell the two
+    explanations apart.
+    """
+    d = _probe(current_a=6, grid_import_w=800.0, import_over_seconds=601.0,
+               probe_on_seconds=10.0)
     assert d.current_a == 0
 
 
@@ -802,9 +816,9 @@ def test_probe_does_not_chatter_across_ticks() -> None:
     permanently unsatisfiable at min current. Pins the run-length guarantees
     -- the min-on floor, the restart cooldown, and charging runs far longer
     than the reported ~15 minutes -- rather than a transition count: at these
-    parameters the probe settles into a stable limit cycle of roughly 45-50
-    min charging against 15 min off, which is expected (the SoC budget binds
-    on a fixed schedule here), not chatter.
+    parameters the probe settles into a stable limit cycle of roughly 55 min
+    charging against ~25 min off, which is expected (the SoC budget binds on
+    a fixed schedule here), not chatter.
     """
     ev_3p = EVParams(
         max_charging_power_kw=22.0, max_charging_current_a=32.0,
@@ -847,14 +861,19 @@ def test_probe_does_not_chatter_across_ticks() -> None:
         else:
             runs.append((is_charging, 1))
         if current > 0:
+            # A transition tick counts as zero elapsed in the new state, not
+            # one whole cycle -- conservative for the floor/cooldown checks,
+            # which see the smaller (not-yet-elapsed) value first.
             on_s = 0.0 if previous == 0 else on_s + cycle_s
             off_s = float("inf") if previous == 0 else off_s
         else:
             off_s = 0.0 if previous > 0 else off_s + cycle_s
             on_s = 0.0
-        # Deficit accrues from real drain while charging, and the curtailed
-        # surplus refills it once the car stops taking it.
-        rate_kw = drain_kw if current > 0 else -surplus_kw
+        # The current in force during this tick is the pre-decision one,
+        # which is what produced drain_kw; the new setpoint only takes effect
+        # next tick. Gating on `current` here would credit a tick of recovery
+        # on the very tick the car was still charging.
+        rate_kw = drain_kw if previous > 0 else -surplus_kw
         deficit = max(0.0, deficit + rate_kw * cycle_s / 3600.0)
 
     # Only complete runs can be checked; the first and last are truncated by
@@ -877,7 +896,13 @@ def test_probe_does_not_chatter_across_ticks() -> None:
     # The actual regression. The reported bug charged ~15 min and then cut out
     # for a cycle, indefinitely. Every charging run must now be substantially
     # longer than that, which is what makes the SoC budget rather than the
-    # instantaneous drain the thing that ends a session.
+    # instantaneous drain the thing that ends a session. The 1800 s (30 min)
+    # bar is derived from this test's own fixture: measured runs are ~55 min
+    # at ev_3p / surplus_kw=3.0 / probe.soc_drop_kwh=0.9, comfortably above
+    # both the ~15 min broken behaviour and this bar. Changing any of those
+    # three values changes the measured run length and may require
+    # revisiting this bar too -- otherwise such a change could silently
+    # weaken it rather than fail loudly.
     assert min(on_runs) >= 1800.0, (
         f"charging runs are still short — the drain test may be deciding "
         f"again rather than the SoC budget: "
