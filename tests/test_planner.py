@@ -2383,6 +2383,12 @@ def test_probe_import_over_since_accumulates_and_resets() -> None:
     p.step(NOW)
     assert p.ev_state.probe_import_over_since == NOW
     assert p.ev_state.probe_current_a == 6   # sustain not met yet
+    # A second over-ceiling tick must NOT re-stamp the clock -- that is the
+    # whole point of the "if is None" guard. Re-stamping on every tick would
+    # make the sustain window unwinnable (it would never accumulate past a
+    # single tick's worth of elapsed time).
+    p.step(NOW + timedelta(minutes=2))
+    assert p.ev_state.probe_import_over_since == NOW
     states["sensor.grid_w"] = StateView(state="0")
     p.step(NOW + timedelta(minutes=5))
     assert p.ev_state.probe_import_over_since is None
@@ -2419,3 +2425,59 @@ def test_probe_arms_despite_clipped_live_pv() -> None:
     p.step(NOW)
     assert p._cached_first_pv_kw == pytest.approx(4.0, abs=1e-6)  # raw, not clamped
     assert p.ev_state.probe_armed is True
+
+
+def test_probe_sequential_ticks_compose_a_run_a_cooldown_and_a_restart() -> None:
+    """Sequential-tick composition test.
+
+    Every other new probe test positions state by direct field assignment and
+    calls ``step()`` once or twice -- none advances a real clock across a
+    sequence of ticks, so none exercises whether ``_elapsed_seconds``, the
+    import clock, and the start/stop transition bookkeeping actually compose
+    correctly. This one drives ``Planner.step()`` through six ticks with a
+    genuinely advancing ``now``, moving only SoC and battery power between
+    calls (as a real inverter/BMS would), and checks the resulting run
+    structure rather than a hand-picked tick count.
+
+    Kept inside the first hour of ``_probe_states()``'s PV forecast (which
+    only covers hour 0) so the probe never disarms on a stale forecast
+    partway through -- the whole run fits in 25 minutes.
+    """
+    from custom_components.pv_optimizer.models import SurplusProbeParams
+    default_probe = SurplusProbeParams()  # min_on_seconds=600, restart_cooldown_seconds=600
+
+    states = _probe_states()
+    p = Planner(_config(ev=_probe_ev_cfg(), battery_power_entity="sensor.batt_w"),
+                FakeReader(states), FakeCaller())
+
+    # (t_seconds, soc_pct, batt_w). SoC/battery driven directly to walk the
+    # probe through: kick to min -> hold at the min-on floor despite drain ->
+    # past the floor with the SoC deficit still under budget -> past budget,
+    # stop -> SoC recovers early but the cooldown isn't served yet, so it
+    # still holds off -> cooldown genuinely served with SoC full -> restart.
+    schedule = [
+        (0,    90.0, "0"),
+        (300,  88.0, "-2000"),
+        (600,  85.0, "-2000"),
+        (900,  78.0, "-2000"),
+        (1000, 90.0, "0"),
+        (1500, 90.0, "0"),
+    ]
+    currents = []
+    for t, soc_pct, batt_w in schedule:
+        states["sensor.soc_pct"] = StateView(state=str(soc_pct), attributes={})
+        states["sensor.batt_w"] = StateView(state=batt_w)
+        p.step(NOW + timedelta(seconds=t))
+        currents.append(p.ev_state.probe_current_a)
+
+    assert currents == [6, 6, 6, 0, 0, 6]
+    # One full on-run (kick at t=0 to stop at t=900) at least as long as the
+    # min-on floor, one full off-run (stop at t=900 to restart at t=1500) at
+    # least as long as the restart cooldown, and a genuine restart -- not a
+    # disarm/re-arm, which would have laundered the cooldown.
+    on_run_seconds = 900 - 0
+    off_run_seconds = 1500 - 900
+    assert on_run_seconds >= default_probe.min_on_seconds
+    assert off_run_seconds >= default_probe.restart_cooldown_seconds
+    assert p.ev_state.probe_armed is True   # never disarmed across the run
+    assert p.ev_state.probe_started_at == NOW + timedelta(seconds=1500)

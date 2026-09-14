@@ -7,7 +7,6 @@ implementations backed by ``hass``.
 from __future__ import annotations
 
 import logging
-import math
 import time as _time
 from dataclasses import dataclass, field, replace
 from datetime import datetime, time, timedelta, timezone
@@ -779,6 +778,17 @@ class Planner:
             return
         mode = self._read_mode()  # "auto" / "car" / "off"
         self.ev_state.last_mode = mode
+        # Charger state is read up front, ahead of every mode-based bypass
+        # branch below (all of which return before the original read point),
+        # so a disconnect is caught even while mode="off" or inside the
+        # planned-start gate -- otherwise the probe's session clocks could
+        # inherit a stale cooldown across a disconnect that happened to span
+        # one of those windows.
+        raw_state = self._read_text(cfg.charger_state_entity)
+        state_class = classify_state(raw_state)
+        if state_class == EVStateClass.DISCONNECTED:
+            # New session on the next plug-in: don't inherit a stale cooldown.
+            self._clear_probe_session_clocks()
         # Future-planned-start gate: in auto mode, the planner drives no
         # charging at all before the scheduled start — that stays the LP's job
         # from planned_start on. We do not even soak up free PV surplus early:
@@ -796,12 +806,12 @@ class Planner:
             if planned_start is not None and planned_start > now:
                 self._write_ev_charger_mode_passive()
                 self._write_ev_start(False)
+                self._reset_probe_session()
                 return
         if mode == "off":
+            self._reset_probe_session()
             return
         # Read inputs.
-        raw_state = self._read_text(cfg.charger_state_entity)
-        state_class = classify_state(raw_state)
         ev_power_w = self._read_charging_power_w(cfg.charging_power_entity)
         price_buy = self._first_slot_buy_price()
         grid_w = self._read_float(self.config.grid_power_entity)
@@ -840,16 +850,15 @@ class Planner:
         # or not it ever actually drew power.
         if mode != "car" or state_class == EVStateClass.DISCONNECTED:
             es.car_session_charging_seen = False
-        if state_class == EVStateClass.DISCONNECTED:
-            # New session on the next plug-in: don't inherit a stale cooldown.
-            es.probe_started_at = None
-            es.probe_stopped_at = None
-            es.probe_import_over_since = None
         # Car mode: planner stays out of the car's way — write max current,
         # active charger mode, and start switch every tick. Auto-return to
         # 'auto' is opt-in via switch.pv_optimizer_ev_car_auto_return; OFF
         # by default (sticky), ON enables today's session-done behavior.
         if mode == "car":
+            # Another path now owns the charger: the probe's belief about an
+            # in-progress session would go stale relative to hardware, so
+            # drop it (preserving the stop clock -- see _reset_probe_session).
+            self._reset_probe_session()
             car_auto_return = self._read_bool_optional(
                 cfg.car_auto_return_entity, default=False)
             if not car_auto_return:
@@ -894,6 +903,9 @@ class Planner:
                 self._write_ev_charger_mode_passive()
             self._write_ev_current(current)
             self._write_ev_start(current > 0)
+            # The LP now owns the charger: same staleness rationale as car
+            # mode above.
+            self._reset_probe_session()
             return
         # Reactive path.
         if self._run_surplus_probe(now, plan_first):
@@ -928,6 +940,37 @@ class Planner:
             self._write_ev_start(decision.max_current_a > 0)
 
     # ---- EV helpers -------------------------------------------------------
+
+    def _reset_probe_session(self) -> None:
+        """Clear the in-progress probe session, preserving the stop clock.
+
+        Called on disarm and whenever another path owns the charger (car mode,
+        an LP-planned charge, the future-planned-start gate), so the probe never
+        resumes on a belief about a session it did not run.
+
+        ``probe_stopped_at`` deliberately survives: it is the restart
+        cooldown's clock, and a bypass or disarm round trip must not launder
+        it. Only a disconnect clears it, via ``_clear_probe_session_clocks``.
+        """
+        es = self.ev_state
+        if es is None:
+            return
+        es.probe_armed = False
+        es.probe_current_a = 0
+        es.probe_cycles_since_up = 0
+        es.probe_cycles_overshooting = 0
+        es.probe_started_at = None
+        es.probe_import_over_since = None
+
+    def _clear_probe_session_clocks(self) -> None:
+        """Full reset including the stop clock — a new car is a new session,
+        so it must not inherit the previous session's cooldown.
+        """
+        es = self.ev_state
+        if es is None:
+            return
+        self._reset_probe_session()
+        es.probe_stopped_at = None
 
     def _run_surplus_probe(self, now: datetime, plan_first) -> bool:
         """If conditions warrant, take over surplus charging from the EVCS and
@@ -964,14 +1007,7 @@ class Planner:
         )
         if not armed:
             if es.probe_armed:
-                es.probe_armed = False
-                es.probe_current_a = 0
-                es.probe_cycles_since_up = 0
-                es.probe_cycles_overshooting = 0
-                es.probe_started_at = None
-                es.probe_import_over_since = None
-                # probe_stopped_at deliberately survives: a disarm/re-arm
-                # round trip must not launder the restart cooldown.
+                self._reset_probe_session()
             return False
         grid_import_w = max(0.0, grid)
         # Soft-import dwell: start the clock on the first tick over the
@@ -992,7 +1028,7 @@ class Planner:
             # No recorded stop => no cooldown to serve. Zero would block the
             # very first kick to min for a full cooldown window.
             probe_off_seconds=_elapsed_seconds(
-                es.probe_stopped_at, now, math.inf),
+                es.probe_stopped_at, now, float("inf")),
             import_over_seconds=_elapsed_seconds(
                 es.probe_import_over_since, now, 0.0),
             soc_deficit_kwh=max(
@@ -1129,7 +1165,10 @@ def _elapsed_seconds(since: datetime | None, now: datetime,
     """Seconds from ``since`` to ``now``, or ``default`` when unset.
 
     Clamped at zero so a clock step backwards can never read as a negative
-    dwell (which would satisfy every "dwell elapsed" comparison at once).
+    dwell. Every dwell comparison in ``decide_surplus_probe`` today is
+    one-directional (a negative value and a clamped zero behave the same),
+    so this is cheap insurance against a future two-sided comparison rather
+    than a fix for a present bug.
     """
     if since is None:
         return default
