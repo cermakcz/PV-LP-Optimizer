@@ -207,5 +207,57 @@ class EVParams:
         return self.max_charging_power_kw / self.max_charging_current_a
 
 
+@dataclass(frozen=True)
+class SurplusProbeParams:
+    """Tunables for the curtailed-surplus probe's minimum-current dwell.
+
+    Separate from :class:`EVParams` on purpose: ``soc_drop_kwh`` is a
+    *home-battery* energy budget, not a charger characteristic.
+
+    At minimum charging current the probe has no down-step available, so the
+    only move is to stop — an expensive move (connector cycling, lost
+    throughput). These four knobs govern it in place of the instantaneous
+    discharge ceilings, which are the wrong instrument there: with the battery
+    full and PV clipped, drain and "surplus arriving via the battery" look
+    identical, and only the SoC trend separates them.
+
+    - ``min_on_seconds``: floor on session length once charging starts.
+      Unconditional apart from the grid-import escapes.
+    - ``restart_cooldown_seconds``: floor on off-time after a stop.
+    - ``soc_drop_kwh``: energy budget. Past the min-on floor, a deficit
+      (``soc_max_kwh - soc_kwh``) beyond this ends the hold. An energy budget
+      rather than a timer is what makes the law self-pacing: mostly-covered
+      charging accrues deficit slowly and continues; no sun at all spends the
+      budget in minutes and stops.
+    - ``import_hard_w``: grid import that stops charging at once, overriding
+      ``min_on_seconds``. Import is real money.
+    """
+
+    min_on_seconds: float = 600.0
+    restart_cooldown_seconds: float = 600.0
+    soc_drop_kwh: float = 1.0
+    import_hard_w: float = 2000.0
+
+    def __post_init__(self) -> None:
+        if self.min_on_seconds <= 0:
+            raise ValueError("min_on_seconds must be > 0")
+        if self.restart_cooldown_seconds <= 0:
+            raise ValueError("restart_cooldown_seconds must be > 0")
+        if self.soc_drop_kwh <= 0:
+            raise ValueError("soc_drop_kwh must be > 0")
+        if self.import_hard_w <= 0:
+            raise ValueError("import_hard_w must be > 0")
+
+    @property
+    def soc_disarm_eps_kwh(self) -> float:
+        """SoC margin below ``soc_max`` within which the probe stays armed.
+
+        Derived rather than configurable: it MUST stay wider than
+        ``soc_drop_kwh``, or the arm/disarm boundary trips before the hold
+        budget does and the probe chatters via disarm/re-arm instead.
+        """
+        return self.soc_drop_kwh + 0.5
+
+
 class OptimizerError(RuntimeError):
     """Raised when the LP is infeasible or the solver fails."""

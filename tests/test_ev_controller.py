@@ -598,3 +598,41 @@ def test_probe_up_gated_by_forecast_headroom() -> None:
 def test_probe_does_not_exceed_max() -> None:
     d = _probe(current_a=32, cycles_since_up=PROBE_UP_INTERVAL_CYCLES - 1)
     assert d.current_a == 32
+
+
+# ---------------------------------------------------------------------------
+# SurplusProbeParams
+# ---------------------------------------------------------------------------
+
+from custom_components.pv_optimizer.models import SurplusProbeParams
+
+
+def test_probe_params_defaults() -> None:
+    p = SurplusProbeParams()
+    assert p.min_on_seconds == 600.0
+    assert p.restart_cooldown_seconds == 600.0
+    assert p.soc_drop_kwh == 1.0
+    assert p.import_hard_w == 2000.0
+
+
+def test_probe_params_disarm_eps_is_derived_above_the_budget() -> None:
+    """The disarm margin must stay wider than the hold budget, or the
+    arm/disarm boundary re-creates the chatter the hold exists to remove.
+    Derived (not configurable) so the invariant cannot be broken from the
+    options form.
+    """
+    assert SurplusProbeParams(soc_drop_kwh=1.0).soc_disarm_eps_kwh == 1.5
+    assert SurplusProbeParams(soc_drop_kwh=0.05).soc_disarm_eps_kwh == 0.55
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"min_on_seconds": 0.0},
+    {"min_on_seconds": -1.0},
+    {"restart_cooldown_seconds": 0.0},
+    {"soc_drop_kwh": 0.0},
+    {"soc_drop_kwh": -0.5},
+    {"import_hard_w": 0.0},
+])
+def test_probe_params_rejects_non_positive(kwargs) -> None:
+    with pytest.raises(ValueError):
+        SurplusProbeParams(**kwargs)
