@@ -665,7 +665,7 @@ already armed, so the probe's own brief overshoot-dip cannot self-disarm):
   charger);
 - `p_sell_kw ≤ ε` — not exporting this slot, i.e. exactly the boundary above;
 - battery effectively full: `soc ≥ soc_max − SOC_FULL_EPS_KWH`
-  (`SOC_DISARM_EPS_KWH` while armed);
+  (the wider, derived `soc_disarm_eps_kwh` while armed — see §9.6);
 - `pv_forecast[0] − load[0] > PROBE_FORECAST_MARGIN_KW`, so the probe never
   kicks the charger awake on a dark clamp. This uses the **raw** slot-0
   forecast captured *before* the §8.2 `min(forecast, live_avg)` clamp — under
@@ -776,9 +776,10 @@ restart_eps < soc_drop_kwh < soc_disarm_eps_kwh
 ```
 
 where `soc_disarm_eps_kwh = soc_drop_kwh + 0.5` kWh — the disarm margin from
-**Arming** above (`SOC_DISARM_EPS_KWH` in the stateless case) is widened to
-track the configured budget, so the probe's own hold cannot self-disarm
-mid-hold.
+**Arming** above. It is derived from the configured budget rather than being a
+fixed constant, so the probe's own hold cannot self-disarm mid-hold: a static
+margin narrower than the budget would trip the disarm before the budget ever
+decided, relocating the chatter to the arm boundary instead of removing it.
 
 Grid import above `PROBE_IMPORT_CEILING_W` (the same 500 W soft ceiling used
 above minimum) also ends the hold at minimum current, but only once it has
@@ -822,7 +823,7 @@ derived from `kw_per_amp`):
 | Constant | Default |
 |---|---|
 | `SOC_FULL_EPS_KWH` | `0.2` kWh |
-| `SOC_DISARM_EPS_KWH` | `0.5` kWh |
+| `soc_disarm_eps_kwh` | derived: `soc_drop_kwh + 0.5` kWh (see §9.6) |
 | `PROBE_FORECAST_MARGIN_KW` | `0.5` kW |
 | `PROBE_DISCHARGE_CEILING_W` | `300` W (soft-band floor) |
 | `PROBE_DISCHARGE_HARD_W` | `1500` W (immediate step-down) |
